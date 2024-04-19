@@ -415,6 +415,8 @@ def fully_quantized(
     use_dummy_static_bound: bool = False,
     dlhs_local_aqt: Optional[LocalAqt] = None,
     drhs_local_aqt: Optional[LocalAqt] = None,
+    # new flag for which calibration mode to use
+    calibration_mode: CalibrationMode = CalibrationMode.CONTRACTING_AXIS,
 ) -> DotGeneral:
   """Fully Quantized Training."""
   cfg = dot_general_make(
@@ -424,6 +426,7 @@ def fully_quantized(
       use_fwd_quant=use_fwd_quant,
       dlhs_local_aqt=dlhs_local_aqt,
       drhs_local_aqt=drhs_local_aqt,
+      calibration_mode=calibration_mode,
   )
 
   # Stochastic Rounding

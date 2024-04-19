@@ -47,6 +47,8 @@ class CalibrationMode(enum.Enum):
 
   CONTRACTING_AXIS = 1
   REMAINING_AXIS = 2
+  ALL_AXES = 3
+  NON_BATCH_AXES = 4
 
 
 class DequantMode(enum.Enum):
@@ -86,12 +88,12 @@ class LocalAqt:
   contraction_axis_shard_count: int = utils.static_field()
 
 
-def tensor_make() -> 'Tensor':
+def tensor_make(calibration_mode=CalibrationMode.CONTRACTING_AXIS) -> 'Tensor':
   """Makes config.Tensor."""
   return Tensor(
       use_fwd_quant=None,
       dequant_mode=DequantMode.OUTPUT,
-      calibration_mode=CalibrationMode.CONTRACTING_AXIS,
+      calibration_mode=calibration_mode,
   )
 
 
@@ -100,10 +102,11 @@ def dot_general_raw_make(
     rhs_bits=None,
     local_aqt=None,
     jax_scope_name='aqt',
+    calibration_mode=CalibrationMode.CONTRACTING_AXIS,
 ) -> 'DotGeneralRaw':
   """Create quantization configs for input matrices to a matmul."""
-  lhs_cfg = tensor_make()
-  rhs_cfg = tensor_make()
+  lhs_cfg = tensor_make(calibration_mode=calibration_mode)
+  rhs_cfg = tensor_make(calibration_mode=calibration_mode)
 
   # Binary uses 0.5 right now.
   if (
@@ -159,14 +162,20 @@ def dot_general_make(
     use_fwd_quant: bool = True,
     dlhs_local_aqt=None,
     drhs_local_aqt=None,
+    calibration_mode=CalibrationMode.CONTRACTING_AXIS,
 ) -> 'DotGeneral':
   """Create quantization configs for input matrices to a matmul."""
-  fwd = dot_general_raw_make(lhs_bits, rhs_bits, jax_scope_name='aqt_fwd')
+  fwd = dot_general_raw_make(
+    lhs_bits, rhs_bits, jax_scope_name='aqt_fwd',
+    calibration_mode=calibration_mode,
+  )
   dlhs = dot_general_raw_make(
-      bwd_bits, bwd_bits, local_aqt=dlhs_local_aqt, jax_scope_name='aqt_dlhs'
+      bwd_bits, bwd_bits, local_aqt=dlhs_local_aqt, jax_scope_name='aqt_dlhs',
+      calibration_mode=calibration_mode,
   )
   drhs = dot_general_raw_make(
-      bwd_bits, bwd_bits, local_aqt=drhs_local_aqt, jax_scope_name='aqt_drhs'
+      bwd_bits, bwd_bits, local_aqt=drhs_local_aqt, jax_scope_name='aqt_drhs',
+      calibration_mode=calibration_mode,
   )
   cfg = DotGeneral(fwd=fwd, dlhs=dlhs, drhs=drhs)
 
@@ -464,6 +473,10 @@ class DotGeneralRaw:
             calibration_axes = utils.get_remaining_axes(ndim, ca, ba)
           case CalibrationMode.CONTRACTING_AXIS:
             calibration_axes = ca
+          case CalibrationMode.NON_BATCH_AXES:
+            calibration_axes = [i for i in range(ndim) if i not in list(ba)]
+          case CalibrationMode.ALL_AXES:
+            calibration_axes = list(range(ndim))
           case _:
             raise ValueError(
                 f'Unknown calibration mode: {tensor_cfg.calibration_mode}'
@@ -492,7 +505,9 @@ class DotGeneralRaw:
         mode = tensor_cfg.calibration_mode
         if (
             output_qtensor.scale_t is None
-            and mode == CalibrationMode.CONTRACTING_AXIS
+            and (mode == CalibrationMode.CONTRACTING_AXIS
+                 or mode == CalibrationMode.NON_BATCH_AXES
+                 or mode == CalibrationMode.ALL_AXES)
         ):
           msg = 'scale, scale_t cannot be both unknown'
           assert output_qtensor.scale is not None, msg
@@ -747,7 +762,7 @@ class DotGeneral:
     unsupported_calibration_dequant_pairs = [
         (DequantMode.OUTPUT, CalibrationMode.REMAINING_AXIS),
         (DequantMode.OTHER_INPUT, CalibrationMode.CONTRACTING_AXIS),
-    ]
+    ]  # TODO(steveabreu) add NON_BATCH_AXES & ALL_AXES pairs
     msg_mode_mismatch = (
         'Unsupported calibration mode - dequant mode combination '
     )
