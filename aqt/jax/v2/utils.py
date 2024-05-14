@@ -103,8 +103,8 @@ def infer_dtype_from_bits(bits: int) -> jnp.dtype | None:
   Returns:
     The corresponding container dtype for the number of bits provided.
   """
-  if bits == 4:
-    return jnp.int4
+  if bits == 4: # this is because jnp.int4 causes many headaches on GPU/throws XLA errors still.
+    return jnp.int8 #jnp.int4
   else:
     if bits <= 8 and bits >= 2:
       return jnp.int8
