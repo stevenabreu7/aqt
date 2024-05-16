@@ -86,15 +86,6 @@ class LocalAqt:
   contraction_axis_shard_count: int = utils.static_field()
 
 
-def tensor_make(calibration_mode=CalibrationMode.CONTRACTING_AXIS) -> 'Tensor':
-  """Makes config.Tensor."""
-  return Tensor(
-      use_fwd_quant=None,
-      dequant_mode=DequantMode.OUTPUT,
-      calibration_mode=calibration_mode,
-  )
-
-
 def dot_general_raw_make(
     lhs_bits=None,
     rhs_bits=None,
@@ -103,8 +94,8 @@ def dot_general_raw_make(
     calibration_mode=CalibrationMode.CONTRACTING_AXIS,
 ) -> 'DotGeneralRaw':
   """Create quantization configs for input matrices to a matmul."""
-  lhs_cfg = tensor_make(calibration_mode=calibration_mode)
-  rhs_cfg = tensor_make(calibration_mode=calibration_mode)
+  lhs_cfg = Tensor(calibration_mode=calibration_mode)
+  rhs_cfg = Tensor(calibration_mode=calibration_mode)
 
   # Binary uses 0.5 right now.
   if (
@@ -497,22 +488,22 @@ class DotGeneralRaw:
           output_qtensor = input_qtensor
         else:
           output_qtensor = calculated_qtensor
-        mode = tensor_cfg.calibration_mode
-        if (
-            output_qtensor.scale_t is None
-            and (mode == CalibrationMode.CONTRACTING_AXIS
-                 or mode == CalibrationMode.NON_BATCH_AXES
-                 or mode == CalibrationMode.ALL_AXES)
-        ):
-          msg = 'scale, scale_t cannot be both unknown'
-          assert output_qtensor.scale is not None, msg
-          output_qtensor = _get_scale_t(
-              qt=output_qtensor,
-              transpose_fn=transpose_fn,
-              dimension_numbers=dimension_numbers,
-              lhs_shape=lhs.shape,
-              rhs_shape=rhs.shape,
-          )
+        # mode = tensor_cfg.calibration_mode
+        # if (
+        #     output_qtensor.scale_t is None
+        #     and (mode == CalibrationMode.CONTRACTING_AXIS
+        #          or mode == CalibrationMode.NON_BATCH_AXES
+        #          or mode == CalibrationMode.ALL_AXES)
+        # ):
+        #   msg = 'scale, scale_t cannot be both unknown'
+        #   assert output_qtensor.scale is not None, msg
+        #   output_qtensor = _get_scale_t(
+        #       qt=output_qtensor,
+        #       transpose_fn=transpose_fn,
+        #       dimension_numbers=dimension_numbers,
+        #       lhs_shape=lhs.shape,
+        #       rhs_shape=rhs.shape,
+        #   )
         return output_qtensor, quant_grad
 
       lhs_calib_axes = _get_calibration_axes(self.lhs, lhs.ndim, lhs_ca, lhs_ba)
