@@ -401,7 +401,7 @@ def default_unquantized_config() -> DotGeneral:
 
 def fully_quantized(
     *,
-    fwd_bits: Optional[int] = 8,
+    fwd_bits: Optional[Union[int, tuple[int]]] = 8,
     bwd_bits: Optional[int] = 8,
     use_fwd_quant: bool = True,
     use_stochastic_rounding: Optional[bool] = True,
@@ -418,9 +418,13 @@ def fully_quantized(
     calibration_mode: CalibrationMode = CalibrationMode.CONTRACTING_AXIS,
 ) -> DotGeneral:
   """Fully Quantized Training."""
+  if isinstance(fwd_bits, tuple):
+    fwd_lhs_bits, fwd_rhs_bits = fwd_bits
+  else:
+    fwd_lhs_bits, fwd_rhs_bits = (fwd_bits, fwd_bits)
   cfg = dot_general_make(
-      lhs_bits=fwd_bits,
-      rhs_bits=fwd_bits,
+      lhs_bits=fwd_lhs_bits,
+      rhs_bits=fwd_rhs_bits,
       bwd_bits=bwd_bits,
       use_fwd_quant=use_fwd_quant,
       dlhs_local_aqt=dlhs_local_aqt,
