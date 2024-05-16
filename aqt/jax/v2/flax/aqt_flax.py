@@ -93,12 +93,8 @@ class Freezer(nn.Module):
     elif self.quant_mode == QuantMode.CONVERT:
       return None
     elif self.quant_mode == QuantMode.SERVE:
-      qvalue = self.qvalue.value
-      # TODO(b/325626080): Remove the optional logic.
-      if self.q_dtype == jnp.int4:
-        qvalue = qvalue.astype(jnp.int4)
       return aqt_tensor.QTensor(
-          qvalue,
+          qvalue=self.qvalue.value,
           scale=None,
           scale_t=[self.scale_t.value],
           # TODO(lew): Ideal solution: To find out this dequant_dtype one should
@@ -110,7 +106,7 @@ class Freezer(nn.Module):
       assert False, 'Unknown quant mode.'
 
   def set(self, inputs: aqt_tensor.QTensor) -> None:
-    # TODO(b/325626080): Uncomment the assert.
+    # TODO(b/325626080): Uncommenting the assert will fail.
     # assert inputs.qvalue.dtype == self.q_dtype, (
     #     f'Freezer got a QTensor of type {inputs.qvalue.dtype} but expected'
     #     f' {self.q_dtype}.'
@@ -120,12 +116,7 @@ class Freezer(nn.Module):
     elif self.quant_mode == QuantMode.CALIBRATE:
       pass
     elif self.quant_mode == QuantMode.CONVERT:
-      qvalue = inputs.qvalue
-      # TODO(b/325626080): Remove the optional logic.
-      if self.q_dtype == jnp.int4:
-        assert qvalue.dtype == jnp.int4
-        qvalue = qvalue.astype(jnp.int8)
-      self.qvalue.value = qvalue
+      self.qvalue.value = inputs.qvalue
       assert inputs.scale_t is not None and len(inputs.scale_t) == 1
       self.scale_t.value = inputs.scale_t[0]
     elif self.quant_mode == QuantMode.SERVE:
@@ -136,8 +127,56 @@ class Freezer(nn.Module):
     return None
 
 
+def _maybe_recover_scale_from_scale_t(
+    qt: aqt_tensor.QTensor | None,
+    dimension_numbers: jax.lax.DotDimensionNumbers,
+    is_rhs: bool,
+    lhs_shape: Sequence[int],
+    rhs_shape: Sequence[int],
+) -> aqt_tensor.QTensor:
+  """Recovers scale from scale_t if necessary."""
+  if qt is None or qt.scale is not None or qt.scale_t is None:
+    return qt
+
+  transpose_fn = transpose.lhs_recover_scale_from_scale_t
+  if is_rhs:
+    transpose_fn = transpose.rhs_recover_scale_from_scale_t
+
+  return qt.replace(
+      scale=[
+          transpose_fn(scale_t, dimension_numbers, lhs_shape, rhs_shape)
+          for scale_t in qt.scale_t
+      ],
+      scale_t=None,
+  )
+
+
+def _populate_scale_t(
+    qt: aqt_tensor.QTensor,
+    dimension_numbers: jax.lax.DotDimensionNumbers,
+    is_rhs: bool,
+    lhs_shape: Sequence[int],
+    rhs_shape: Sequence[int],
+) -> aqt_tensor.QTensor:
+  """Populates scale_t from scale."""
+  if qt.scale is None:
+    return qt
+
+  transpose_fn = transpose.lhs_scale_transpose_to_output
+  if is_rhs:
+    transpose_fn = transpose.rhs_scale_transpose_to_output
+
+  return qt.replace(
+      scale_t=[
+          transpose_fn(scale, dimension_numbers, lhs_shape, rhs_shape)
+          for scale in qt.scale
+      ]
+  )
+
+
 class AqtDotGeneral(nn.Module):
   """A layer that can be injected into flax.nn.Dense, etc."""
+
   cfg: Optional[aqt_dot_general.DotGeneral] = None
   prng_name: Optional[str] = 'params'
 
@@ -169,7 +208,7 @@ class AqtDotGeneral(nn.Module):
   # Freeze mode. Set as FreezerMode.CALIBRATION to store only scales; set as
   # CALIBRATION_AND_VALUE to store both scales and quantized values.
   lhs_freeze_mode: FreezerMode = FreezerMode.NONE
-  rhs_freeze_mode: FreezerMode = FreezerMode.CALIBRATION_AND_VALUE
+  rhs_freeze_mode: FreezerMode = FreezerMode.NONE
 
   # If you want use 'params' make sure that there is another mechanism to hide
   # these variables from the optimizer.
@@ -247,32 +286,43 @@ class AqtDotGeneral(nn.Module):
 
       def init_wrapper(
           qt: aqt_tensor.QTensor,
+          contracting_axis: Sequence[utils.AxisIdx],
           axis_metadata_wrapper: Optional[AxisMetadataWrapper],
       ):
         if axis_metadata_wrapper is None:
           return qt
 
-        # We are not doing any sharding for scale and scale_t, for now.
-        scale_non_shard_axis = range(qt.ndim)
+        scale_non_shard_axis_all = list(range(qt.ndim))
+        scale_non_shard_axis_contracting = list(contracting_axis)
 
         qt = qt.replace(
             qvalue=axis_metadata_wrapper(qt.qvalue, []),
-            scale=jax.tree_map(
-                lambda x: axis_metadata_wrapper(x, scale_non_shard_axis),
+            scale=jax.tree.map(
+                lambda x: axis_metadata_wrapper(
+                    x, scale_non_shard_axis_contracting
+                ),
                 qt.scale,
             ),
-            scale_t=jax.tree_map(
-                lambda x: axis_metadata_wrapper(x, scale_non_shard_axis),
+            # Passing scale_non_shard_axis_contracting would be incorrect due to
+            # scale transposition. scale_t is being removed from QTensor anyway
+            # so we just pass scale_non_shard_axis_all.
+            scale_t=jax.tree.map(
+                lambda x: axis_metadata_wrapper(x, scale_non_shard_axis_all),
                 qt.scale_t,
             ),
         )
         return qt
 
+      lhs_ca, rhs_ca = contr
       lhs_init_wrapper = functools.partial(
-          init_wrapper, axis_metadata_wrapper=self.lhs_axis_metadata_wrapper
+          init_wrapper,
+          contracting_axis=lhs_ca,
+          axis_metadata_wrapper=self.lhs_axis_metadata_wrapper
       )
       rhs_init_wrapper = functools.partial(
-          init_wrapper, axis_metadata_wrapper=self.rhs_axis_metadata_wrapper
+          init_wrapper,
+          contracting_axis=rhs_ca,
+          axis_metadata_wrapper=self.rhs_axis_metadata_wrapper
       )
 
       lhs_freezer = general_freezer.Freezer(
@@ -326,6 +376,15 @@ class AqtDotGeneral(nn.Module):
       lhs_qt = lhs_freezer.get() if lhs_apply_quant_mode else self.lhs_qtensor
       rhs_qt = rhs_freezer.get() if rhs_apply_quant_mode else self.rhs_qtensor
 
+      # Recover scale from scale_t, if necessary.
+      # The quantized tensor loaded from the legacy freezer has only scale_t.
+      lhs_qt = _maybe_recover_scale_from_scale_t(
+          lhs_qt, dimension_numbers, False, lhs_shape, rhs_shape
+      )
+      rhs_qt = _maybe_recover_scale_from_scale_t(
+          rhs_qt, dimension_numbers, True, lhs_shape, rhs_shape
+      )
+
       cfg.apply_custom_vjp_on_jax = False
       out, (out_lhs_qt, out_rhs_qt) = aqt_flax_dg_core.dg_core_flax_lifted(
           lhs, rhs, lhs_qt, rhs_qt, dimension_numbers, self, cfg
@@ -361,6 +420,18 @@ class AqtDotGeneral(nn.Module):
           raise ValueError('Unknown freeze mode: %s' % self.rhs_freeze_mode)
 
       # Setter
+      calib_contracting_axis = aqt_dot_general.CalibrationMode.CONTRACTING_AXIS
+      if self.use_legacy_freezer:
+        # We need to populate the stored QTensor with scale_t.
+        if cfg.fwd.lhs.calibration_mode == calib_contracting_axis:
+          out_lhs_qt = _populate_scale_t(
+              out_lhs_qt, dimension_numbers, False, lhs_shape, rhs_shape
+          )
+        if cfg.fwd.rhs.calibration_mode == calib_contracting_axis:
+          out_rhs_qt = _populate_scale_t(
+              out_rhs_qt, dimension_numbers, True, lhs_shape, rhs_shape
+          )
+
       if self.lhs_apply_quant_mode:
         lhs_freezer.set(out_lhs_qt)
       if self.rhs_apply_quant_mode:
@@ -443,7 +514,7 @@ class AqtEinsum(nn.Module):
   # Freeze mode. Set as FreezerMode.CALIBRATION to store only scales; set as
   # CALIBRATION_AND_VALUE to store both scales and quantized values.
   lhs_freeze_mode: FreezerMode = FreezerMode.NONE
-  rhs_freeze_mode: FreezerMode = FreezerMode.CALIBRATION_AND_VALUE
+  rhs_freeze_mode: FreezerMode = FreezerMode.NONE
 
   # If you want use 'params' make sure that there is another mechanism to hide
   # these variables from the optimizer.
