@@ -48,7 +48,7 @@ else:
   ArrayT: TypeAlias = jnp.ndarray
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class QTensor:
   """Quantized tensor."""
 
@@ -70,9 +70,14 @@ class QTensor:
   scale_t: Optional[list[ArrayT]]
 
   # DType of the tensor before quantized.
+  # NOTE: AQT Users should use the public property, dtype, instead.
   dequant_dtype: Optional[jnp.dtype] = flax.struct.field(
       pytree_node=False, default=None
   )
+
+  @property
+  def dtype(self) -> jnp.dtype | None:
+    return self.dequant_dtype
 
   def is_full(self) -> bool:
     return self.qvalue is not None
@@ -80,6 +85,9 @@ class QTensor:
   def without_qvalue(self) -> Self:
     """Returns a copy of the QTensor without the qvalue."""
     return self.replace(qvalue=None)  # pytype: disable=attribute-error
+
+  def astype(self, dtype: jnp.dtype) -> Self:
+    return self.replace(dequant_dtype=dtype)  # pytype: disable=attribute-error
 
   def quant(self, x):
     assert not self.is_full(), 'Already quantized QTensor.'
@@ -140,12 +148,15 @@ class QTensor:
 
 
 def zeros(
-    shape: Sequence[int], qdtype: jnp.dtype, dequant_dtype: jnp.dtype
+    shape: Sequence[int],
+    *,
+    container_dtype: jnp.dtype,
+    dequant_dtype: jnp.dtype = jnp.bfloat16,
 ) -> QTensor:
   return QTensor(
-      qvalue=jnp.zeros(shape, dtype=qdtype),
+      qvalue=jnp.zeros(shape, dtype=container_dtype),
       scale=[],
-      scale_t=[],
+      scale_t=None,
       dequant_dtype=dequant_dtype,
   )
 
@@ -153,21 +164,41 @@ def zeros(
 def zeros_with_scale(
     shape: Sequence[int],
     calibration_axis: Sequence[utils.AxisIdx],
-    qdtype: jnp.dtype,
-    dequant_dtype: jnp.dtype,
+    *,
+    container_dtype: jnp.dtype | None = None,
+    scale_dtype: jnp.dtype | None = None,
+    dequant_dtype: jnp.dtype = jnp.bfloat16,
 ) -> QTensor:
   """Initializes a QTensor with empty qvalue along with empty scale value."""
   scale_shape = list(shape)
   for axis in calibration_axis:
     scale_shape[axis] = 1
+  scale_dtype = scale_dtype or dequant_dtype
 
   # TODO(lew): hardcode dequant_dtype to bf16. This requires updating
   # other libraries to not break their functionality.
   return QTensor(
-      jnp.zeros(shape, dtype=qdtype),
-      [jnp.ones(scale_shape, dtype=dequant_dtype)],
-      None,
+      qvalue=jnp.zeros(shape, dtype=container_dtype),
+      scale=[jnp.ones(scale_shape, dtype=scale_dtype)],
+      scale_t=None,
       dequant_dtype=dequant_dtype,
+  )
+
+
+def partition_spec(
+    partitions: Sequence[Any],
+    calibration_axis: Sequence[utils.AxisIdx],
+    dtype: jnp.dtype,
+) -> QTensor:
+  """Returns a QTensor filled with partition specs."""
+  scale_partitions = list(partitions)
+  for axis in calibration_axis:
+    scale_partitions[axis] = None
+  return QTensor(
+      qvalue=jax.sharding.PartitionSpec(*partitions),
+      scale=[jax.sharding.PartitionSpec(*scale_partitions)],
+      scale_t=None,
+      dequant_dtype=dtype,
   )
 
 
@@ -203,10 +234,10 @@ def dynamic_slice(
     return jax.lax.dynamic_slice(scale, scale_start_indices, scale_slice_sizes)
 
   return QTensor(
-      jax.lax.dynamic_slice(operand.qvalue, start_indices, slice_sizes),
-      [get_sliced_scales(s) for s in operand.scale],
-      None,
-      operand.dequant_dtype,
+      qvalue=jax.lax.dynamic_slice(operand.qvalue, start_indices, slice_sizes),
+      scale=[get_sliced_scales(s) for s in operand.scale],
+      scale_t=None,
+      dequant_dtype=operand.dequant_dtype,
   )
 
 
@@ -250,7 +281,12 @@ def dynamic_update_slice(
       for scale, update_scale in zip(operand.scale, update.scale)
   ]
 
-  return QTensor(qvalues, scales, None, operand.dequant_dtype)
+  return QTensor(
+      qvalue=qvalues,
+      scale=scales,
+      scale_t=None,
+      dequant_dtype=operand.dequant_dtype,
+  )
 
 
 def update_frame(operand: QTensor, frame: int, update: QTensor) -> QTensor:
@@ -259,11 +295,11 @@ def update_frame(operand: QTensor, frame: int, update: QTensor) -> QTensor:
   assert operand.dequant_dtype == update.dequant_dtype, 'Dequant dtype mismatch'
 
   return QTensor(
-      operand.qvalue.at[frame].set(update.qvalue),
-      [
+      qvalue=operand.qvalue.at[frame].set(update.qvalue),
+      scale=[
           target_scale.at[frame].set(update_scale)
           for target_scale, update_scale in zip(operand.scale, update.scale)
       ],
-      None,
-      operand.dequant_dtype,
+      scale_t=None,
+      dequant_dtype=operand.dequant_dtype,
   )

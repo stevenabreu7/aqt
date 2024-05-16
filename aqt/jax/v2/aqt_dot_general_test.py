@@ -466,8 +466,16 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
       dict(dg=config.dot_general_make(2, 2)),
       dict(dg=config.dot_general_make(8, 8)),
       dict(dg=config.dot_general_make(8, 8), clip_gradient=True),
-      dict(dg=config.dot_general_make(8, 8, dlhs_local_aqt=aqt.LocalAqt(2))),
-      dict(dg=config.dot_general_make(8, 8, drhs_local_aqt=aqt.LocalAqt(2))),
+      dict(
+          dg=config.dot_general_make(
+              8, 8, dlhs_local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2)
+          )
+      ),
+      dict(
+          dg=config.dot_general_make(
+              8, 8, drhs_local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2)
+          )
+      ),
       # That test could fail numerically because bf16
       # can't keep in the product of int8*int8 accurately.
       # It just so happens that this test does not fail but others do.
@@ -488,7 +496,7 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
           dg=fqt_param_dict(
               s=10,
               use_fwd_quant=True,
-              dlhs_local_aqt=aqt.LocalAqt(2),
+              dlhs_local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2),
           )["dg"],
           dims=(((0, 2), (1, 0)), ((3, 1), (2, 4))),
           # contraction: 2, 5; batch: 4, 3
@@ -596,12 +604,18 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
     check([
         (
             "default    ",
-            aqt_dg_full(aqt.DequantMode.OUTPUT, local_aqt=aqt.LocalAqt(2)),
+            aqt_dg_full(
+                aqt.DequantMode.OUTPUT,
+                local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2),
+            ),
             dict(),
         ),
         (
             "default    ",
-            aqt_dg_full(aqt.DequantMode.THIS_INPUT, local_aqt=aqt.LocalAqt(2)),
+            aqt_dg_full(
+                aqt.DequantMode.THIS_INPUT,
+                local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2),
+            ),
             dict(),
         ),
     ])
@@ -648,8 +662,16 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
       dict(dg=config.dot_general_make(2, 2)),
       dict(dg=config.dot_general_make(8, 8)),
       dict(dg=config.dot_general_make(8, 8), clip_gradient=True),
-      dict(dg=config.dot_general_make(8, 8, dlhs_local_aqt=aqt.LocalAqt(2))),
-      dict(dg=config.dot_general_make(8, 8, drhs_local_aqt=aqt.LocalAqt(2))),
+      dict(
+          dg=config.dot_general_make(
+              8, 8, dlhs_local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2)
+          )
+      ),
+      dict(
+          dg=config.dot_general_make(
+              8, 8, drhs_local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2)
+          )
+      ),
       # That test could fail numerically because bf16
       # can't keep in the product of int8*int8 accurately.
       # It just so happens that this test does not fail but others do.
@@ -666,7 +688,7 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
           rhs_shape=(5, 2, 4, 6, 3),  # non-contr: 4, 6, 3
           gra_shape=(4, 3, 6),
       ),
-      *[fqt_param_dict(s, use_fwd_quant=None) for s in range(10)],
+      *[fqt_param_dict(s, use_fwd_quant=False) for s in range(10)],
   ])
   def test_dot_general_calibration_with_remaining_axis(
       self,
@@ -687,9 +709,9 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
     # absl.app.run() in some environments.
     if not isinstance(dg, config.DotGeneral):
       dg = dg()
-    # Set use_fwd_quant to None.
-    dg.drhs.rhs.use_fwd_quant = None
-    dg.dlhs.rhs.use_fwd_quant = None
+    # Set use_fwd_quant to False.
+    dg.drhs.rhs.use_fwd_quant = False
+    dg.dlhs.rhs.use_fwd_quant = False
     readonly_dg = dg
     del dg
 
@@ -784,7 +806,7 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
             aqt_dg_full(
                 aqt.DequantMode.THIS_INPUT,
                 aqt.CalibrationMode.REMAINING_AXIS,
-                local_aqt=aqt.LocalAqt(2),
+                local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2),
             ),
             dict(),
         ),
@@ -795,7 +817,7 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
                 aqt.DequantMode.THIS_INPUT,
                 aqt.CalibrationMode.REMAINING_AXIS,
                 aqt.CalibrationMode.REMAINING_AXIS,
-                local_aqt=aqt.LocalAqt(2),
+                local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2),
             ),
             dict(),
         ),
@@ -806,14 +828,14 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
                 aqt.DequantMode.OTHER_INPUT,
                 aqt.CalibrationMode.REMAINING_AXIS,
                 aqt.CalibrationMode.REMAINING_AXIS,
-                local_aqt=aqt.LocalAqt(2),
+                local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2),
             ),
             dict(),
         ),
     ])
 
   def test_dot_general_calibrate_dequant_mode_mismatch(self):
-    dg = config.dot_general_make(8, 8, use_fwd_quant=None)
+    dg = config.dot_general_make(8, 8, use_fwd_quant=False)
     dims = (((1,), (0,)), ((), ()))
     lhs = rand_unif((10, 20), 10.0, 0, jnp.float32)
     rhs = rand_unif((20, 30), 20.0, 1, jnp.float32)
@@ -846,19 +868,16 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
           dims=dims,
       )(lhs, rhs)
 
-  @parameterized.parameters([False, True])
-  def test_dot_general_prevent_fwd_quant_with_remaining_axis(
-      self, use_fwd_quant
-  ):
-    """If calibration axis is remaining_axis, use_fwd_quant should be None."""
-    dg = config.dot_general_make(8, 8, use_fwd_quant=use_fwd_quant)
+  def test_dot_general_prevent_fwd_quant_with_remaining_axis(self):
+    """If calibration axis is remaining_axis, use_fwd_quant should be False."""
+    dg = config.dot_general_make(8, 8, use_fwd_quant=True)
     dims = (((1,), (0,)), ((), ()))
     lhs = rand_unif((10, 20), 10.0, 0, jnp.float32)
     rhs = rand_unif((20, 30), 20.0, 1, jnp.float32)
 
     with self.assertRaisesRegex(
         AssertionError,
-        ".*use_fwd_quant should be set to None.*",
+        ".*use_fwd_quant should be set to False.*",
     ):
       _aqt_dg_full_lr_diff(
           aqt.DequantMode.THIS_INPUT,
@@ -871,8 +890,16 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
 
   @parameterized.parameters([
       dict(dg=config.dot_general_make(8, 8)),
-      dict(dg=config.dot_general_make(8, 8, dlhs_local_aqt=aqt.LocalAqt(2))),
-      dict(dg=config.dot_general_make(8, 8, drhs_local_aqt=aqt.LocalAqt(2))),
+      dict(
+          dg=config.dot_general_make(
+              8, 8, dlhs_local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2)
+          )
+      ),
+      dict(
+          dg=config.dot_general_make(
+              8, 8, drhs_local_aqt=aqt.LocalAqt(contraction_axis_shard_count=2)
+          )
+      ),
   ])
   def test_dot_general_equality_between_different_calibration_axes(
       self,
@@ -881,9 +908,9 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
     """Check equality between different calibration axes."""
     dims = (((1,), (0,)), ((), ()))
 
-    # Set use_fwd_quant to None.
-    dg.drhs.rhs.use_fwd_quant = None
-    dg.dlhs.rhs.use_fwd_quant = None
+    # Set use_fwd_quant to False.
+    dg.drhs.rhs.use_fwd_quant = False
+    dg.dlhs.rhs.use_fwd_quant = False
     readonly_dg = dg
     del dg
 
@@ -1041,7 +1068,7 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
         fwd_bits=8,
         bwd_bits=8,
         use_stochastic_rounding=False,
-        drhs_local_aqt=aqt.LocalAqt(shard_count),
+        drhs_local_aqt=aqt.LocalAqt(contraction_axis_shard_count=shard_count),
     )
     dg.fwd.dg_quantizer.lhs.numerics = (
         dg.fwd.dg_quantizer.lhs.numerics.replace(preserve_max_val=True)

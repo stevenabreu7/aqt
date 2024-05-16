@@ -66,24 +66,22 @@ class DequantMode(enum.Enum):
   OTHER_INPUT = 3
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class Tensor:
   """Configuration of quantization of one tensor or one side of tensor op."""
 
   # Controls at what value of input tensor should be used.
   # Setting it to True, but not quantizing fwd pass will assert-fail.
-  use_fwd_quant: Optional[bool] = utils.static_field()
+  use_fwd_quant: bool = utils.static_field(default=False)
   # Dequantization mode.
-  dequant_mode: DequantMode = utils.static_field()
+  dequant_mode: DequantMode = utils.static_field(default=DequantMode.OUTPUT)
   # Calibration axis mode.
-  calibration_mode: CalibrationMode = utils.static_field()
-
-  @classmethod
-  def make(cls, *args, **kwargs) -> Self:
-    return tensor_make(*args, **kwargs)
+  calibration_mode: CalibrationMode = utils.static_field(
+      default=CalibrationMode.CONTRACTING_AXIS
+  )
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class LocalAqt:
   contraction_axis_shard_count: int = utils.static_field()
 
@@ -192,13 +190,13 @@ def dot_general_make(
 # ------------------------------------------------------------------------------
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class MultiTensor:
   x: jnp.ndarray
   qx: aqt_tensor.QTensor
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class TensorRes:
   """All the things we pass from the forward pass to the backward pass."""
 
@@ -206,7 +204,7 @@ class TensorRes:
   quant_grad: aqt_tensor.GradientFn
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class DotGeneralRes:
   lhs: TensorRes
   rhs: TensorRes
@@ -233,15 +231,15 @@ def _get_scale_t(
     dimension_numbers: lax.DotDimensionNumbers,
     lhs_shape: Sequence[int],
     rhs_shape: Sequence[int],
-) -> aqt_tensor.QTensor:
+) -> Sequence[jnp.ndarray]:
   list_scale_t = []
   for scale in qt.scale:
     scale_t = transpose_fn(scale, dimension_numbers, lhs_shape, rhs_shape)
     list_scale_t.append(scale_t)
-  return qt.replace(scale_t=list_scale_t)
+  return list_scale_t
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class DotGeneralQuantizer(abc.ABC):
   """Abstract class for dot_general quantizer."""
 
@@ -308,7 +306,7 @@ class DotGeneralQuantizer(abc.ABC):
     pass
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class DefaultDotGeneralQuantizer(DotGeneralQuantizer):
   """Default dot_general quantizer."""
 
@@ -363,7 +361,7 @@ class DefaultDotGeneralQuantizer(DotGeneralQuantizer):
     self.rhs.context = rhs_context
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class DotGeneralRaw:
   """Configuration of quantization of one dot_general without gradient."""
 
@@ -409,28 +407,27 @@ class DotGeneralRaw:
       #  - Can we carry untransposed scale and transpose here?
       if isinstance(rhs, MultiTensor):
         # We are in gradient code.
-        fwd_quantized = rhs.qx.scale_t is not None and len(rhs.qx.scale_t) == 1  # pytype: disable=attribute-error
-        expect_fwd_quantized = self.rhs.use_fwd_quant is not None
+        fwd_quantized = rhs.qx.scale is not None and len(rhs.qx.scale) == 1  # pytype: disable=attribute-error
         msg = (
-            'If fwd is quantized, use_fwd_quant should be either True/False;'
-            ' otherwise, use_fwd_quant should be None. Misconfiguration: found'
-            f' use_fwd_quant is {self.rhs.use_fwd_quant} in bwd, but fwd'
-            f' quantization is {fwd_quantized}.'
+            f'Found use_fwd_quant is {self.rhs.use_fwd_quant} in bwd, but fwd'
+            ' is not quantized.'
         )
-        assert fwd_quantized == expect_fwd_quantized, msg
         if self.rhs.use_fwd_quant:
           assert fwd_quantized, msg
+          scale_t = transpose.rhs_scale_transpose_for_lhs_input(
+              rhs.qx.scale[0], dimension_numbers, lhs.shape  # pytype: disable=attribute-error
+          )
+
           # Cast rhs scales to lhs dtype when multiplying with lhs. This is to
           # avoid an unexpected upcast when rhs is float32 but lhs is float16.
-          lhs = lhs * rhs.qx.scale_t[0].astype(lhs.dtype)  # pytype: disable=attribute-error
+          lhs = lhs * scale_t.astype(lhs.dtype)  # pytype: disable=attribute-error
+
           # rhs qvalue may be integer. It will be quantized again later, so cast
           # its dtype back to dequant dtype.
           # TODO(yichizh): avoid double quantization and evaluate model quality.
           rhs = rhs.qx.qvalue.astype(rhs.qx.dequant_dtype)  # pytype: disable=attribute-error
         else:
           rhs = rhs.x  # pytype: disable=attribute-error
-      else:
-        assert self.rhs.use_fwd_quant is None, 'cannot set use_fwd_quant in fwd'
 
       if self.local_aqt is not None:
         local_aqt = self.local_aqt
@@ -487,8 +484,6 @@ class DotGeneralRaw:
           input_qtensor: Optional[aqt_tensor.QTensor],
           calculated_qtensor: aqt_tensor.QTensor,
           quant_grad: aqt_tensor.GradientFn,
-          tensor_cfg: Tensor,
-          transpose_fn: Any,
       ) -> tuple[aqt_tensor.QTensor, str | aqt_tensor.GradientFn]:
         """Compute qtensor from input or input_qtensor."""
         if input_qtensor is not None:
@@ -546,8 +541,6 @@ class DotGeneralRaw:
           lhs_qt,
           lhs_qt_calculated,
           lhs_quant_grad,
-          self.lhs,
-          transpose.lhs_scale_transpose_to_output,
       )
       lhs_mt = MultiTensor(x=lhs, qx=lhs_qt)
       lhs_res = TensorRes(mt=lhs_mt, quant_grad=lhs_quant_grad)
@@ -556,8 +549,6 @@ class DotGeneralRaw:
           rhs_qt,
           rhs_qt_calculated,
           rhs_quant_grad,
-          self.rhs,
-          transpose.rhs_scale_transpose_to_output,
       )
       rhs_mt = MultiTensor(x=rhs, qx=rhs_qt)
       rhs_res = TensorRes(mt=rhs_mt, quant_grad=rhs_quant_grad)
@@ -666,13 +657,28 @@ def _qtensor_dot_general(
   assert out.scale is not None  # pytype help
 
   if cfg.lhs.dequant_mode == DequantMode.OUTPUT:
-    out.scale.extend(lhs_qt.scale_t)
+    extend_scale = _get_scale_t(
+        qt=lhs_qt,
+        transpose_fn=transpose.lhs_scale_transpose_to_output,
+        dimension_numbers=dimension_numbers,
+        lhs_shape=lhs_qin.shape,
+        rhs_shape=rhs_qin.shape,
+    )
+
+    out.scale.extend(extend_scale)
   if cfg.rhs.dequant_mode == DequantMode.OUTPUT:
-    out.scale.extend(rhs_qt.scale_t)
+    extend_scale = _get_scale_t(
+        qt=rhs_qt,
+        transpose_fn=transpose.rhs_scale_transpose_to_output,
+        dimension_numbers=dimension_numbers,
+        lhs_shape=lhs_qin.shape,
+        rhs_shape=rhs_qin.shape,
+    )
+    out.scale.extend(extend_scale)
   return out
 
 
-@utils.flax_slots_dataclass
+@utils.flax_slots_kw_only_dataclass
 class DotGeneral:
   """Configuration of quantization of dot_general and its gradients."""
 
@@ -739,9 +745,11 @@ class DotGeneral:
     """Asserts if configuration is valid."""
 
     # use_fwd_quant is not enabled when calibration_axis = remaining_axis.
+    # TODO: b/336198483 - Enable use_fwd_quant flag in the case.
+    expected_fwd_quant = False
     msg_fwd_quant = (
-        'use_fwd_quant should be set to None when remaining axis are used for'
-        ' calibration axis.'
+        f'use_fwd_quant should be set to {expected_fwd_quant} when remaining'
+        ' axis are used for calibration axis.'
     )
 
     if self.fwd.rhs.calibration_mode == CalibrationMode.REMAINING_AXIS:
@@ -749,14 +757,14 @@ class DotGeneral:
           f'rhs.calibration_mode: {self.fwd.rhs.calibration_mode},'
           f' dlhs use_fwd_quant: {self.dlhs.rhs.use_fwd_quant}'
       )
-      assert self.dlhs.rhs.use_fwd_quant is None, msg_fwd_quant
+      assert self.dlhs.rhs.use_fwd_quant is expected_fwd_quant, msg_fwd_quant
 
     if self.fwd.lhs.calibration_mode == CalibrationMode.REMAINING_AXIS:
       msg_fwd_quant += (
           f'lhs.calibration_mode: {self.fwd.lhs.calibration_mode},'
           f' drhs use_fwd_quant: {self.drhs.rhs.use_fwd_quant}'
       )
-      assert self.drhs.rhs.use_fwd_quant is None, msg_fwd_quant
+      assert self.drhs.rhs.use_fwd_quant is expected_fwd_quant, msg_fwd_quant
 
     # Check valid combination between calibration_mode and dequant_mode
     unsupported_calibration_dequant_pairs = [

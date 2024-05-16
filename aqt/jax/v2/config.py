@@ -37,7 +37,6 @@ from aqt.jax.v2.aqt_dot_general import DotGeneralRaw
 from aqt.jax.v2.aqt_dot_general import dtypes_allowed_for_int32_accum
 from aqt.jax.v2.aqt_dot_general import LocalAqt
 from aqt.jax.v2.aqt_dot_general import Tensor
-from aqt.jax.v2.aqt_dot_general import tensor_make
 
 from aqt.jax.v2.aqt_quantizer import quantizer_make
 
@@ -364,7 +363,7 @@ def default_unquantized_config() -> DotGeneral:
 
   def tensor_cfg() -> Tensor:
     cfg = Tensor(
-        use_fwd_quant=None,
+        use_fwd_quant=False,
         dequant_mode=DequantMode.OUTPUT,
         calibration_mode=CalibrationMode.CONTRACTING_AXIS,
     )
@@ -537,6 +536,8 @@ def config_v4(
     fwd_accumulator_dtype: Union[jnp.dtype, None, SkipT] = SKIP,
     dlhs_accumulator_dtype: Union[jnp.dtype, None, SkipT] = SKIP,
     drhs_accumulator_dtype: Union[jnp.dtype, None, SkipT] = SKIP,
+    dlhs_use_fwd_quant: Union[bool, None, SkipT] = SKIP,
+    drhs_use_fwd_quant: Union[bool, None, SkipT] = SKIP,
 ) -> DotGeneral:
   """Version 4 of user-visible AQT config."""
   cfg = default_unquantized_config()
@@ -569,9 +570,11 @@ def config_v4(
       dlhs_local_aqt=dlhs_local_aqt,
       drhs_local_aqt=drhs_local_aqt,
   )
-  # TODO(yichizh): remove set_use_fwd_quant here since it will be automatically
-  # set in set_bits. Or make them as an argument.
-  set_use_fwd_quant(cfg, dlhs_use_fwd_quant=False, drhs_use_fwd_quant=False)
+  set_use_fwd_quant(
+      cfg,
+      dlhs_use_fwd_quant=dlhs_use_fwd_quant,
+      drhs_use_fwd_quant=drhs_use_fwd_quant,
+  )
   assert cfg.fwd.local_aqt is None, 'local_aqt is not yet supported in fwd.'
   return cfg
 
