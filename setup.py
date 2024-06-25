@@ -53,7 +53,8 @@ setup(
     author="Cerebra Catalyst team",
     author_email="cerebra-catalyst-team@google.com",
     url="https://github.com/google/aqt",
-    packages=find_packages(),
+    # packages=find_packages(),
+    packages=['aqt', 'aqt.jax', 'aqt.jax.v2', 'aqt.jax.v2.numerics', 'aqt.jax.v2.flax'],
     zip_safe=False,
     extras_require={
         "jax_legacy": jax_legacy_install_requires,
