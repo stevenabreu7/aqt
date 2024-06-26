@@ -60,7 +60,7 @@ class Freezer(nn.Module):
           pass
         case FreezerMode.WRITE:
           s = self.variable(self.collection, _FREEZE_VAR_NAME, initializer)
-          s.value = inputs
+          # s.value = inputs  # NOTE(stevenabreu): this fails (immutable value)
           return None
         case FreezerMode.READ:
           # Set in READ mode works as an initializer for checkpoint reading.
