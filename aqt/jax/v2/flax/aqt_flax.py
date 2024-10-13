@@ -18,7 +18,8 @@
 import copy
 import enum
 import functools
-from typing import Callable, Iterable, Optional, Sequence, Union
+from typing import Callable, Iterable, Sequence
+from aqt.jax.v2 import aqt_conv_general
 from aqt.jax.v2 import aqt_dot_general
 from aqt.jax.v2 import aqt_tensor
 from aqt.jax.v2 import config
@@ -36,8 +37,66 @@ import jax.numpy as jnp
 
 NoShardingAxes = Sequence[utils.AxisIdx]
 AxisMetadataWrapper = Callable[
-    [jnp.ndarray, NoShardingAxes], nn_meta.AxisMetadata
+    [jnp.ndarray, None | tiled_dot_general.AqtTileMap, NoShardingAxes],
+    nn_meta.AxisMetadata,
 ]
+DotGeneralTilingFn = Callable[
+    [jnp.ndarray, jnp.ndarray, jax.lax.DotDimensionNumbers],
+    tiled_dot_general.Cfg
+]
+EinsumTilingFn = Callable[
+    [tiled_dot_general.EinsumEqnLetter, jnp.ndarray, jnp.ndarray],
+    tiled_dot_general.Cfg
+]
+
+
+_QUANT_TO_FREEZER_MODE = {
+    QuantMode.TRAIN: general_freezer.FreezerMode.NONE,
+    QuantMode.CALIBRATE: general_freezer.FreezerMode.NONE,
+    QuantMode.CONVERT: general_freezer.FreezerMode.WRITE,
+    QuantMode.SERVE: general_freezer.FreezerMode.READ,
+}
+
+
+def _freezer_qtensor_init_wrapper(
+    qt: aqt_tensor.QTensor,
+    contracting_axis: Sequence[utils.AxisIdx],
+    axis_metadata_wrapper: None | AxisMetadataWrapper,
+    tile_map: tiled_dot_general.AqtTileMap,
+):
+  """QTensor initialization wrapper function for the new freezer."""
+  # Copy to avoid mutating the input QTensor here or downstream (regardless of
+  # axis_metadata_wrapper's value).
+  qt = copy.deepcopy(qt)
+  if axis_metadata_wrapper is None:
+    return qt
+
+  scale_non_shard_axis_all = list(range(qt.ndim))
+  scale_non_shard_axis_contracting = list(contracting_axis)
+
+  def _get_singleton_axes(x: jnp.ndarray) -> list[utils.AxisIdx]:
+    return [axis for axis, dim in enumerate(x.shape) if dim == 1]
+
+  qt.qvalue = axis_metadata_wrapper(qt.qvalue, tile_map, [])
+  qt.scale = jax.tree.map(
+      lambda x: axis_metadata_wrapper(
+          x, tile_map, scale_non_shard_axis_contracting
+      ),
+      qt.scale,
+  )
+  # Passing scale_non_shard_axis_contracting would be incorrect due to
+  # scale transposition. scale_t is being removed from QTensor anyway
+  # so we just pass scale_non_shard_axis_all.
+  qt.scale_t = jax.tree.map(
+      lambda x: axis_metadata_wrapper(x, tile_map, scale_non_shard_axis_all),
+      qt.scale_t,
+  )
+  # Set the non-sharding axes for bias to the singleton dimensions.
+  qt.bias = jax.tree.map(
+      lambda x: axis_metadata_wrapper(x, tile_map, _get_singleton_axes(x)),
+      qt.bias,
+  )
+  return qt
 
 
 class FreezerMode(enum.Enum):
@@ -51,7 +110,7 @@ class Freezer(nn.Module):
 
   On default it is an identity function that saves the input in a variable.
   In 'quant_mode=QuantMode.Serve' mode, ignores the input and returns the frozen
-  value. It is usefult to implement 'constant folding' and put quantized weights
+  value. It is useful to implement 'constant folding' and put quantized weights
   and scales in the checkpoint for serving. Specifically:
 
   self.get() returns None when quant_mode=TRAIN or CONVERT, returns variable
@@ -85,7 +144,7 @@ class Freezer(nn.Module):
       self.qvalue = self.variable(collection, 'value', q_init, q_shape, q_dtype)
       self.scale_t = self.variable(collection, 'scale', s_init, s_shape)
 
-  def get(self) -> Optional[aqt_tensor.QTensor]:
+  def get(self) -> None | aqt_tensor.QTensor:
     if self.quant_mode == QuantMode.TRAIN:
       return None
     elif self.quant_mode == QuantMode.CALIBRATE:
@@ -97,6 +156,7 @@ class Freezer(nn.Module):
           qvalue=self.qvalue.value,
           scale=None,
           scale_t=[self.scale_t.value],
+          bias=[],
           # TODO(lew): Ideal solution: To find out this dequant_dtype one should
           # use the dtype of inputs of the quant function. We should store it as
           # a dtype of small-sized scale tensor.
@@ -111,6 +171,10 @@ class Freezer(nn.Module):
     #     f'Freezer got a QTensor of type {inputs.qvalue.dtype} but expected'
     #     f' {self.q_dtype}.'
     # )
+    if inputs.bias:
+      raise NotImplementedError(
+          'Quantization biases are not supported in AQT Flax Legacy Freezer.'
+      )
     if self.quant_mode == QuantMode.TRAIN:
       pass
     elif self.quant_mode == QuantMode.CALIBRATE:
@@ -128,7 +192,7 @@ class Freezer(nn.Module):
 
 
 def _maybe_recover_scale_from_scale_t(
-    qt: aqt_tensor.QTensor | None,
+    qt: None | aqt_tensor.QTensor,
     dimension_numbers: jax.lax.DotDimensionNumbers,
     is_rhs: bool,
     lhs_shape: Sequence[int],
@@ -141,14 +205,12 @@ def _maybe_recover_scale_from_scale_t(
   transpose_fn = transpose.lhs_recover_scale_from_scale_t
   if is_rhs:
     transpose_fn = transpose.rhs_recover_scale_from_scale_t
-
-  return qt.replace(
-      scale=[
-          transpose_fn(scale_t, dimension_numbers, lhs_shape, rhs_shape)
-          for scale_t in qt.scale_t
-      ],
-      scale_t=None,
-  )
+  qt.scale = [
+      transpose_fn(scale_t, dimension_numbers, lhs_shape, rhs_shape)
+      for scale_t in qt.scale_t
+  ]
+  qt.scale_t = None
+  return qt
 
 
 def _populate_scale_t(
@@ -165,20 +227,18 @@ def _populate_scale_t(
   transpose_fn = transpose.lhs_scale_transpose_to_output
   if is_rhs:
     transpose_fn = transpose.rhs_scale_transpose_to_output
-
-  return qt.replace(
-      scale_t=[
-          transpose_fn(scale, dimension_numbers, lhs_shape, rhs_shape)
-          for scale in qt.scale
-      ]
-  )
+  qt.scale_t = [
+      transpose_fn(scale, dimension_numbers, lhs_shape, rhs_shape)
+      for scale in qt.scale
+  ]
+  return qt
 
 
 class AqtDotGeneral(nn.Module):
   """A layer that can be injected into flax.nn.Dense, etc."""
 
-  cfg: Optional[aqt_dot_general.DotGeneral] = None
-  prng_name: Optional[str] = 'params'
+  cfg: None | aqt_dot_general.DotGeneral = None
+  prng_name: None | str = 'params'
 
   # TODO(lew): split out separate class for each side.
   # Quant mode determines whether flax variables are created to store quantized
@@ -187,12 +247,12 @@ class AqtDotGeneral(nn.Module):
   # apply_quant_mode determines if using Freezer in cfg.get/set_tensor
   lhs_apply_quant_mode: bool = True
   lhs_var_name: str = 'qlhs'
-  lhs_qtensor: Optional[aqt_tensor.QTensor] = None
+  lhs_qtensor: None | aqt_tensor.QTensor = None
 
   rhs_quant_mode: QuantMode = QuantMode.TRAIN
   rhs_apply_quant_mode: bool = True
   rhs_var_name: str = 'qrhs'
-  rhs_qtensor: Optional[aqt_tensor.QTensor] = None
+  rhs_qtensor: None | aqt_tensor.QTensor = None
 
   # Variables only for the legacy Freezer.
   lhs_init: nn.initializers.Initializer = jnp.zeros
@@ -202,8 +262,8 @@ class AqtDotGeneral(nn.Module):
   rhs_scale_init: nn.initializers.Initializer = jnp.zeros
 
   # Variables only for the new Freezer.
-  lhs_axis_metadata_wrapper: Optional[AxisMetadataWrapper] = None
-  rhs_axis_metadata_wrapper: Optional[AxisMetadataWrapper] = None
+  lhs_axis_metadata_wrapper: None | AxisMetadataWrapper = None
+  rhs_axis_metadata_wrapper: None | AxisMetadataWrapper = None
 
   # Freeze mode. Set as FreezerMode.CALIBRATION to store only scales; set as
   # CALIBRATION_AND_VALUE to store both scales and quantized values.
@@ -213,7 +273,10 @@ class AqtDotGeneral(nn.Module):
   # If you want use 'params' make sure that there is another mechanism to hide
   # these variables from the optimizer.
   quant_collection: str = 'aqt'
-  tiling_cfg: Optional[tiled_dot_general.Cfg] = None
+
+  # Tiling configs. tilling_fn is valid only when tiling_cfg is None.
+  tiling_cfg: None | tiled_dot_general.Cfg = None
+  tiling_fn: None | DotGeneralTilingFn = None
 
   # If set to True, use the current Freezer. Otherwise, use the new
   # QuantFreezer.
@@ -224,6 +287,8 @@ class AqtDotGeneral(nn.Module):
       lhs_shape,
       rhs_shape,
       dimension_numbers: tuple[Iterable[int], Iterable[int]],
+      lhs_tile_map: None | tiled_dot_general.AqtTileMap = None,
+      rhs_tile_map: None | tiled_dot_general.AqtTileMap = None,
   ):
     if self.cfg is None:
       return jax.lax.dot_general
@@ -277,64 +342,30 @@ class AqtDotGeneral(nn.Module):
           quant_collection=self.quant_collection,
       )
     else:
-      quant_to_freezer_mode = {
-          QuantMode.TRAIN: general_freezer.FreezerMode.NONE,
-          QuantMode.CALIBRATE: general_freezer.FreezerMode.NONE,
-          QuantMode.CONVERT: general_freezer.FreezerMode.WRITE,
-          QuantMode.SERVE: general_freezer.FreezerMode.READ,
-      }
-
-      def init_wrapper(
-          qt: aqt_tensor.QTensor,
-          contracting_axis: Sequence[utils.AxisIdx],
-          axis_metadata_wrapper: Optional[AxisMetadataWrapper],
-      ):
-        if axis_metadata_wrapper is None:
-          return qt
-
-        scale_non_shard_axis_all = list(range(qt.ndim))
-        scale_non_shard_axis_contracting = list(contracting_axis)
-
-        qt = qt.replace(
-            qvalue=axis_metadata_wrapper(qt.qvalue, []),
-            scale=jax.tree.map(
-                lambda x: axis_metadata_wrapper(
-                    x, scale_non_shard_axis_contracting
-                ),
-                qt.scale,
-            ),
-            # Passing scale_non_shard_axis_contracting would be incorrect due to
-            # scale transposition. scale_t is being removed from QTensor anyway
-            # so we just pass scale_non_shard_axis_all.
-            scale_t=jax.tree.map(
-                lambda x: axis_metadata_wrapper(x, scale_non_shard_axis_all),
-                qt.scale_t,
-            ),
-        )
-        return qt
-
       lhs_ca, rhs_ca = contr
       lhs_init_wrapper = functools.partial(
-          init_wrapper,
+          _freezer_qtensor_init_wrapper,
           contracting_axis=lhs_ca,
-          axis_metadata_wrapper=self.lhs_axis_metadata_wrapper
+          axis_metadata_wrapper=self.lhs_axis_metadata_wrapper,
+          tile_map=lhs_tile_map,
       )
       rhs_init_wrapper = functools.partial(
-          init_wrapper,
+          _freezer_qtensor_init_wrapper,
           contracting_axis=rhs_ca,
-          axis_metadata_wrapper=self.rhs_axis_metadata_wrapper
+          axis_metadata_wrapper=self.rhs_axis_metadata_wrapper,
+          tile_map=rhs_tile_map,
       )
 
       lhs_freezer = general_freezer.Freezer(
           name=self.lhs_var_name,
-          mode=quant_to_freezer_mode[lhs_qm],
+          mode=_QUANT_TO_FREEZER_MODE[lhs_qm],
           collection=self.quant_collection,
           axis_metadata_wrapper=lhs_init_wrapper,
       )
 
       rhs_freezer = general_freezer.Freezer(
           name=self.rhs_var_name,
-          mode=quant_to_freezer_mode[rhs_qm],
+          mode=_QUANT_TO_FREEZER_MODE[rhs_qm],
           collection=self.quant_collection,
           axis_metadata_wrapper=rhs_init_wrapper,
       )
@@ -450,11 +481,18 @@ class AqtDotGeneral(nn.Module):
       precision,
       preferred_element_type=None,
   ):
-    if self.tiling_cfg is not None:
+    tiling_cfg = self.tiling_cfg
+    if tiling_cfg is None and self.tiling_fn is not None:
+      tiling_cfg = self.tiling_fn(lhs, rhs, dimension_numbers)
+
+    if tiling_cfg is not None:
+      xlhs, xrhs = tiled_dot_general.generate_tiling_states_for_dot_general(
+          tiling_cfg, lhs, rhs, dimension_numbers
+      )
       # Extract tiled input shapes and dimension numbers from jaxpr
       def dummy_tiled_dg(lhs_in, rhs_in):
         return tiled_dot_general.tiled_dot_general(
-            self.tiling_cfg, lhs_in, rhs_in, dimension_numbers
+            tiling_cfg, lhs_in, rhs_in, dimension_numbers
         )
 
       tiled_dg_jaxpr = jax.make_jaxpr(dummy_tiled_dg)(lhs, rhs)
@@ -467,13 +505,17 @@ class AqtDotGeneral(nn.Module):
       # Use tiled input shapes and dimension numbers to create aqt_dg that
       # will be injected to tiled_dot_general
       aqt_dg = self.make_aqt_dg(
-          tiled_lhs_shape, tiled_rhs_shape, tiled_dimension_numbers
+          tiled_lhs_shape,
+          tiled_rhs_shape,
+          tiled_dimension_numbers,
+          lhs_tile_map=xlhs.tile_map,
+          rhs_tile_map=xrhs.tile_map,
       )
       # We integrate tiling here and not on Jax level, so that the Freezers
       # observe tiled shapes.
       ret_dg = functools.partial(
           tiled_dot_general.tiled_dot_general,
-          self.tiling_cfg,
+          tiling_cfg,
           dot_general=aqt_dg,
       )
     else:
@@ -490,8 +532,8 @@ class AqtDotGeneral(nn.Module):
 class AqtEinsum(nn.Module):
   """Quantized Einsum class for model injection."""
 
-  cfg: Optional[config.DotGeneral] = None
-  prng_name: Optional[str] = 'params'
+  cfg: None | config.DotGeneral = None
+  prng_name: None | str = 'params'
 
   # TODO(lew): split out separate class for each side.
   lhs_quant_mode: QuantMode = QuantMode.TRAIN
@@ -508,8 +550,8 @@ class AqtEinsum(nn.Module):
   rhs_scale_init: nn.initializers.Initializer = jnp.zeros
 
   # Variables only for the new Freezer.
-  lhs_axis_metadata_wrapper: Optional[AxisMetadataWrapper] = None
-  rhs_axis_metadata_wrapper: Optional[AxisMetadataWrapper] = None
+  lhs_axis_metadata_wrapper: None | AxisMetadataWrapper = None
+  rhs_axis_metadata_wrapper: None | AxisMetadataWrapper = None
 
   # Freeze mode. Set as FreezerMode.CALIBRATION to store only scales; set as
   # CALIBRATION_AND_VALUE to store both scales and quantized values.
@@ -520,10 +562,11 @@ class AqtEinsum(nn.Module):
   # these variables from the optimizer.
   quant_collection: str = 'aqt'
 
-  assert_eqn: Optional[str] = None
-  assert_lhs_shape: Optional[utils.ShapeTemplate] = None
-  assert_rhs_shape: Optional[utils.ShapeTemplate] = None
-  tile_sizes: Optional[tiled_dot_general.EinsumTileSizes] = None
+  assert_eqn: None | str = None
+  assert_lhs_shape: None | utils.ShapeTemplate = None
+  assert_rhs_shape: None | utils.ShapeTemplate = None
+  tile_sizes: None | tiled_dot_general.EinsumTileSizes = None
+  tiling_fn: None | EinsumTilingFn = None
 
   # If set to True, use the current Freezer. Otherwise, use the new
   # QTensorFreezer.
@@ -533,8 +576,8 @@ class AqtEinsum(nn.Module):
   def __call__(
       self,
       eqn,
-      lhs_g: Union[jnp.ndarray, aqt_tensor.QTensor],
-      rhs_g: Union[jnp.ndarray, aqt_tensor.QTensor],
+      lhs_g: jnp.ndarray | aqt_tensor.QTensor,
+      rhs_g: jnp.ndarray | aqt_tensor.QTensor,
   ):
     if self.assert_eqn is not None:
       utils.assert_eq(eqn, self.assert_eqn, 'einsum_eqn')
@@ -560,7 +603,15 @@ class AqtEinsum(nn.Module):
     # from being rejected by assertions in aqt_dot_general.py, line 522-526 and
     # 414.
     # TODO: b/322111904 - Handle this in more proper way.
-    lhs_in, rhs_in = nn.dtypes.promote_dtype(lhs_in, rhs_in)
+    # We hand-hold int4 because promote_dtype(int4, x) fails.
+    # (To avoid unintended promotion, 4-bit integers do not support
+    # implicit promotion.)
+    if lhs_in.dtype == jnp.int4:
+      lhs_in = jnp.float32(lhs_in)
+    if rhs_in.dtype == jnp.int4:
+      rhs_in = jnp.float32(rhs_in)
+    if lhs_in.dtype != jnp.int4 and rhs_in.dtype != jnp.int4:
+      lhs_in, rhs_in = nn.dtypes.promote_dtype(lhs_in, rhs_in)
 
     # yes_swap = whether einsum swaps [lhs,rhs] when passing them to dot_general
     einsum = functools.partial(aqt_dot_general.einsum, eqn=eqn)
@@ -594,6 +645,8 @@ class AqtEinsum(nn.Module):
     tiling_config = None
     if self.tile_sizes is not None:
       tiling_config = tiled_dot_general.Cfg.from_einsum(eqn, self.tile_sizes)
+    elif self.tiling_fn is not None:
+      tiling_config = self.tiling_fn(eqn, lhs_in, rhs_in)
 
     if yes_swap:
       if cfg is not None:
@@ -644,3 +697,204 @@ class AqtEinsum(nn.Module):
         rhs_freeze_mode=rhs_freeze_mode,
     )
     return einsum(lhs=lhs_in, rhs=rhs_in, dg=aqt_dg)
+
+
+class AqtConvGeneralDilated(nn.Module):
+  """A layer that can be injected into flax.nn.Dense, etc."""
+
+  cfg: None | aqt_dot_general.DotGeneral = None
+  prng_name: None | str = 'params'
+
+  # TODO(lew): split out separate class for each side.
+  # Quant mode determines whether flax variables are created to store quantized
+  # inputs. Refer to the Freezer doc str to see variable creation in each mode.
+  lhs_quant_mode: QuantMode = QuantMode.TRAIN
+  # apply_quant_mode determines if using Freezer in cfg.get/set_tensor
+  lhs_apply_quant_mode: bool = True
+  lhs_var_name: str = 'qlhs'
+  lhs_qtensor: None | aqt_tensor.QTensor = None
+
+  rhs_quant_mode: QuantMode = QuantMode.TRAIN
+  rhs_apply_quant_mode: bool = True
+  rhs_var_name: str = 'qrhs'
+  rhs_qtensor: None | aqt_tensor.QTensor = None
+
+  # Variables only for the new Freezer.
+  lhs_axis_metadata_wrapper: None | AxisMetadataWrapper = None
+  rhs_axis_metadata_wrapper: None | AxisMetadataWrapper = None
+
+  # Freeze mode. Set as FreezerMode.CALIBRATION to store only scales; set as
+  # CALIBRATION_AND_VALUE to store both scales and quantized values.
+  lhs_freeze_mode: FreezerMode = FreezerMode.NONE
+  rhs_freeze_mode: FreezerMode = FreezerMode.NONE
+
+  # If you want use 'params' make sure that there is another mechanism to hide
+  # these variables from the optimizer.
+  quant_collection: str = 'aqt'
+
+  def make_aqt_cg(
+      self,
+  ):
+    if self.cfg is None:
+      return jax.lax.conv_general_dilated
+
+    cfg = copy.deepcopy(self.cfg)
+    rhs_qm = self.rhs_quant_mode
+    lhs_qm = self.lhs_quant_mode
+
+    assert isinstance(
+        cfg.fwd.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+    )
+    lhs_init_wrapper = functools.partial(
+        _freezer_qtensor_init_wrapper,
+        contracting_axis=[],
+        axis_metadata_wrapper=self.lhs_axis_metadata_wrapper,
+        tile_map=None,
+    )
+    rhs_init_wrapper = functools.partial(
+        _freezer_qtensor_init_wrapper,
+        contracting_axis=[],
+        axis_metadata_wrapper=self.rhs_axis_metadata_wrapper,
+        tile_map=None,
+    )
+    lhs_freezer = general_freezer.Freezer(
+        name=self.lhs_var_name,
+        mode=_QUANT_TO_FREEZER_MODE[lhs_qm],
+        collection=self.quant_collection,
+        axis_metadata_wrapper=lhs_init_wrapper,
+    )
+    rhs_freezer = general_freezer.Freezer(
+        name=self.rhs_var_name,
+        mode=_QUANT_TO_FREEZER_MODE[rhs_qm],
+        collection=self.quant_collection,
+        axis_metadata_wrapper=rhs_init_wrapper,
+    )
+
+    prng_name = self.prng_name
+    key = self.make_rng(prng_name) if prng_name is not None else None
+
+    cfg = config.set_context(
+        cfg,
+        key,
+        train_step=None,
+        lhs_quant_mode=self.lhs_quant_mode,
+        rhs_quant_mode=self.rhs_quant_mode,
+    )
+
+    def ret_cg(
+        lhs,
+        rhs,
+        window_strides,
+        padding,
+        lhs_dilation,
+        rhs_dilation,
+        dimension_numbers,
+        feature_group_count,
+        batch_group_count,
+        precision,
+        preferred_element_type,
+    ):
+      # TODO(yichizh): asserting xhs dtype only when apply_quant_mode=False
+      # and cfg.get_qtensor() is None
+      msg = 'AQT is not yet optimized to accept quantized types directly. '
+      msg += f'lhs.dtype: {lhs.dtype}, rhs.dtype: {rhs.dtype}'
+      assert lhs.dtype in [jnp.bfloat16, jnp.float32, jnp.float16], msg
+      assert rhs.dtype in [jnp.bfloat16, jnp.float32, jnp.float16], msg
+
+      cfg.assert_config_validity()
+
+      # Getter
+      lhs_apply_quant_mode = self.lhs_apply_quant_mode
+      rhs_apply_quant_mode = self.rhs_apply_quant_mode
+      lhs_qt = lhs_freezer.get() if lhs_apply_quant_mode else self.lhs_qtensor
+      rhs_qt = rhs_freezer.get() if rhs_apply_quant_mode else self.rhs_qtensor
+
+      cfg.apply_custom_vjp_on_jax = False
+      aqt_conv = aqt_conv_general.make_conv_general_dilated_with_qt(cfg.fwd)
+      out, (out_lhs_qt, out_rhs_qt) = aqt_conv(
+          lhs,
+          rhs,
+          window_strides,
+          padding,
+          lhs_qt,
+          rhs_qt,
+          lhs_dilation,
+          rhs_dilation,
+          dimension_numbers,
+          feature_group_count,
+          batch_group_count,
+          precision,
+          preferred_element_type
+          )
+
+      # Remove qvalue of the activation to not to store it in Freezer.
+      match self.lhs_freeze_mode:
+        case FreezerMode.NONE:
+          if self.lhs_apply_quant_mode and self.lhs_quant_mode in {
+              QuantMode.CONVERT,
+              QuantMode.SERVE,
+          }:
+            raise ValueError('Freezer is used with Freezer mode NONE.')
+        case FreezerMode.CALIBRATION:
+          out_lhs_qt = out_lhs_qt.without_qvalue()
+        case FreezerMode.CALIBRATION_AND_VALUE:
+          pass
+        case _:
+          raise ValueError('Unknown freeze mode: %s' % self.lhs_freeze_mode)
+
+      match self.rhs_freeze_mode:
+        case FreezerMode.NONE:
+          if self.rhs_apply_quant_mode and self.rhs_quant_mode in {
+              QuantMode.CONVERT,
+              QuantMode.SERVE,
+          }:
+            raise ValueError('Freezer is used with Freezer mode NONE.')
+        case FreezerMode.CALIBRATION:
+          out_rhs_qt = out_rhs_qt.without_qvalue()
+        case FreezerMode.CALIBRATION_AND_VALUE:
+          pass
+        case _:
+          raise ValueError('Unknown freeze mode: %s' % self.rhs_freeze_mode)
+
+      if self.lhs_apply_quant_mode:
+        lhs_freezer.set(out_lhs_qt)
+      if self.rhs_apply_quant_mode:
+        rhs_freezer.set(out_rhs_qt)
+
+      return out
+
+    return ret_cg
+
+  @nn.compact
+  def __call__(
+      self,
+      lhs,
+      rhs,
+      window_strides: Sequence[int],
+      padding: str | Sequence[tuple[int, int]],
+      lhs_dilation: None | Sequence[int] = None,
+      rhs_dilation: None | Sequence[int] = None,
+      dimension_numbers: (
+          None
+          | jax.lax.ConvGeneralDilatedDimensionNumbers
+          | tuple[str, str, str]
+      ) = None,
+      feature_group_count: int = 1,
+      batch_group_count: int = 1,
+      precision: jax.lax.PrecisionLike = None,
+      preferred_element_type=None,
+  ):
+
+    return self.make_aqt_cg()(
+        lhs,
+        rhs,
+        window_strides,
+        padding,
+        lhs_dilation,
+        rhs_dilation,
+        dimension_numbers,
+        feature_group_count,
+        batch_group_count,
+        precision,
+        preferred_element_type,
+    )

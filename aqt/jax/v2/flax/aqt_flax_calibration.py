@@ -17,6 +17,7 @@ from typing import Sequence
 
 from aqt.jax.v2 import calibration
 from aqt.jax.v2 import utils
+from aqt.jax.v2.numerics import numerics
 import flax.linen as nn
 from jax import numpy as jnp
 
@@ -38,8 +39,8 @@ class MeanOfAbsMaxCalibration(calibration.Calibration, nn.Module):
   def get_bound(
       self,
       x: jnp.ndarray,
-      shared_axes: Sequence[utils.AxisIdx] | None,
-      context: utils.Context | None = None,
+      shared_axes: None | Sequence[utils.AxisIdx],
+      context: None | utils.Context = None,
   ) -> jnp.ndarray:
     abs_max = jnp.max(jnp.abs(x), axis=shared_axes, keepdims=True)
     quant_mode = context.quant_mode if context else utils.QuantMode.TRAIN
@@ -72,6 +73,19 @@ class MeanOfAbsMaxCalibration(calibration.Calibration, nn.Module):
     # use this feature.
     # Maybe wait for the JAX language upgrade to have a better support for this?
     return sum_of_max.value / count.value
+
+  def get_scale_and_bias(
+      self,
+      x: jnp.ndarray,
+      shared_axes: None | Sequence[utils.AxisIdx],
+      numerics_: numerics.AqtNumerics,
+      context: None | utils.Context = None,
+  ) -> tuple[list[jnp.ndarray], list[jnp.ndarray]]:
+    dtype = self.dtype if self.dtype is not None else x.dtype
+    bound = self.get_bound(x, shared_axes, context)
+    scale = bound / numerics_.get_quant_bound()
+    scale = calibration.ceil_to_po2(scale) if self.po2_scale else scale
+    return [scale.astype(dtype)], []
 
 
 # TODO: b/335764538 - Check the math correctness of the module.
@@ -130,8 +144,8 @@ class WeightedStatsCalibration(calibration.Calibration, nn.Module):
       self,
       var: nn.Variable,
       s: jnp.ndarray,
-      shared_axes: Sequence[utils.AxisIdx] | None,
-      weight: jnp.ndarray | None = None,
+      shared_axes: None | Sequence[utils.AxisIdx],
+      weight: None | jnp.ndarray = None,
       reduce_max: bool = False,
   ):
     """Updates the given Flax variable."""
@@ -163,8 +177,8 @@ class WeightedStatsCalibration(calibration.Calibration, nn.Module):
   def get_bound(
       self,
       x: jnp.ndarray,
-      shared_axes: Sequence[utils.AxisIdx] | None,
-      context: utils.Context | None = None,
+      shared_axes: None | Sequence[utils.AxisIdx],
+      context: None | utils.Context = None,
   ) -> jnp.ndarray:
     if self.lp_order > 30:
       raise NotImplementedError("For higher norms we should add stabilization.")
@@ -222,3 +236,16 @@ class WeightedStatsCalibration(calibration.Calibration, nn.Module):
         + self.max_dev_coeff * self._max_dev()
         + self.const_bound_coeff
     )
+
+  def get_scale_and_bias(
+      self,
+      x: jnp.ndarray,
+      shared_axes: None | Sequence[utils.AxisIdx],
+      numerics_: numerics.AqtNumerics,
+      context: None | utils.Context = None,
+  ) -> tuple[list[jnp.ndarray], list[jnp.ndarray]]:
+    dtype = self.dtype if self.dtype is not None else x.dtype
+    bound = self.get_bound(x, shared_axes, context)
+    scale = bound / numerics_.get_quant_bound()
+    scale = calibration.ceil_to_po2(scale) if self.po2_scale else scale
+    return [scale.astype(dtype)], []

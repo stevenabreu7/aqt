@@ -22,8 +22,8 @@ from jax import numpy as jnp
 def dg_core_flax_lifted(
     lhs: jnp.ndarray,
     rhs: jnp.ndarray,
-    lhs_qt: aqt_tensor.QTensor | None,
-    rhs_qt: aqt_tensor.QTensor | None,
+    lhs_qt: None | aqt_tensor.QTensor,
+    rhs_qt: None | aqt_tensor.QTensor,
     dimension_numbers: jax.lax.DotDimensionNumbers,
     mdl: nn.Module,
     cfg: aqt_dot_general.DotGeneral,
@@ -42,12 +42,13 @@ def dg_core_flax_lifted(
   Returns:
     aqt DotGeneral result. Flax-lifted custom_vjp is applied on it.
   """
+
   def _dg_core_flax_lifted(
       mdl: nn.Module,
       lhs: jnp.ndarray,
       rhs: jnp.ndarray,
-      lhs_qt: aqt_tensor.QTensor | None,
-      rhs_qt: aqt_tensor.QTensor | None,
+      lhs_qt: None | aqt_tensor.QTensor,
+      rhs_qt: None | aqt_tensor.QTensor,
       dimension_numbers: jax.lax.DotDimensionNumbers,
       cfg: aqt_dot_general.DotGeneral,
   ):
@@ -67,18 +68,29 @@ def dg_core_flax_lifted(
       mdl: nn.Module,
       lhs: jnp.ndarray,
       rhs: jnp.ndarray,
-      lhs_qt: aqt_tensor.QTensor | None,
-      rhs_qt: aqt_tensor.QTensor | None,
+      lhs_qt: None | aqt_tensor.QTensor,
+      rhs_qt: None | aqt_tensor.QTensor,
       dimension_numbers: jax.lax.DotDimensionNumbers,
       cfg: aqt_dot_general.DotGeneral,
   ):
     """Lifted custom vjp_fwd."""
+
     # Currently we do not support backward computation for the variables
     # declared INSIDE the AqtDotGeneral layer.
     # Since we do not have any gradient functions for the params, removing
     # jax.lax.stop_gradient here will lead to NotImplementedError of
-    # differentiation rules for 'custom_lin'.
-    params = jax.lax.stop_gradient(mdl.variables)
+    # differentiation rules for 'custom_lin'. MutableArrays should not be passed
+    # through stop_gradient, so we need to filter those out from this logic.
+    def stop_grad_for_non_ref_params(param):
+      if isinstance(
+          jax.core.get_aval(param),
+          # pylint: disable-next=protected-access
+          jax._src.state.types.AbstractRef,
+      ):
+        return param
+      return jax.lax.stop_gradient(param)
+
+    params = jax.tree_util.tree_map(stop_grad_for_non_ref_params, mdl.variables)
     out, res = aqt_dot_general.dg_core_vjp_fwd(
         lhs, rhs, lhs_qt, rhs_qt, dimension_numbers, cfg
     )
@@ -88,7 +100,7 @@ def dg_core_flax_lifted(
       fwd_dimension_numbers: jax.lax.DotDimensionNumbers,
       res: tuple[
           tuple[
-              aqt_dot_general.DotGeneralRes | None,
+              None | aqt_dot_general.DotGeneralRes,
               aqt_dot_general.DotGeneral,
           ],
           jax.core.ParamDict,
@@ -113,6 +125,3 @@ def dg_core_flax_lifted(
   return dg_core_with_custom_vjp(
       mdl, lhs, rhs, lhs_qt, rhs_qt, dimension_numbers, cfg
   )
-
-
-

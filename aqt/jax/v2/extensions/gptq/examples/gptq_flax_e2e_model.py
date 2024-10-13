@@ -42,17 +42,24 @@ def update_cfg_with_gptq(aqt_cfg: aqt_dot_general.DotGeneral) -> None:
       aqt_cfg.fwd.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
   )
   assert isinstance(
-      aqt_cfg.fwd.dg_quantizer.lhs.numerics, int_numerics.IntNumerics
+      aqt_cfg.fwd.dg_quantizer.lhs.numerics, int_numerics.IntSymmetric
   )
   assert isinstance(
-      aqt_cfg.fwd.dg_quantizer.rhs.numerics, int_numerics.IntNumerics
+      aqt_cfg.fwd.dg_quantizer.rhs.numerics, int_numerics.IntSymmetric
   )
   lhs_bits = aqt_cfg.fwd.dg_quantizer.lhs.numerics.bits
   rhs_bits = aqt_cfg.fwd.dg_quantizer.rhs.numerics.bits
-  lhs = aqt_quantizer.quantizer_make(lhs_bits)
-  rhs = aqt_quantizer.quantizer_make(rhs_bits)
+  lhs = aqt_quantizer.quantizer_make(lhs_bits, initialize_calibration=False)
+  rhs = aqt_quantizer.quantizer_make(rhs_bits, initialize_calibration=False)
+  lhs_mid = aqt_quantizer.quantizer_make(lhs_bits, initialize_calibration=False)
+  rhs_mid = aqt_quantizer.quantizer_make(rhs_bits, initialize_calibration=False)
   gptq_dg_quantizer = gptq_dot_general_quantizer.GptqDotGeneralQuantizer(
-      lhs=lhs, rhs=rhs, sharding_axes=None, quant_collection='gptq'
+      lhs=lhs,
+      rhs=rhs,
+      lhs_mid=lhs_mid,
+      rhs_mid=rhs_mid,
+      sharding_axes=None,
+      quant_collection='gptq',
   )
 
   aqt_cfg.fwd.dg_quantizer = gptq_dg_quantizer
@@ -62,9 +69,11 @@ def main(argv):
   del argv
 
   # 1. TRAIN.
-  aqt_cfg = aqt_config.fully_quantized(fwd_bits=8, bwd_bits=8)
+  aqt_cfg_dg = aqt_config.fully_quantized(fwd_bits=8, bwd_bits=8)
+  num_epochs = 1
+  workdir = '/tmp/aqt_mnist_example'
   state = train_and_evaluate(
-      num_epochs=1, workdir='/tmp/aqt_mnist_example', aqt_cfg=aqt_cfg
+      num_epochs, workdir, aqt_cfg_dg=aqt_cfg_dg
   )
 
   # 2. Apply GPTQ Calibration. (Hinv collection).

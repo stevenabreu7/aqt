@@ -14,12 +14,15 @@
 """Configuration dataclasses."""
 
 from typing import Literal, Sequence
+
 from aqt.jax.v2 import aqt_tensor
 from aqt.jax.v2 import calibration
+from aqt.jax.v2 import tiled_dot_general
 from aqt.jax.v2 import utils
-from aqt.jax.v2.numerics import int_numerics
+from aqt.jax.v2.numerics import fp8_numerics
 from aqt.jax.v2.numerics import no_numerics
 from aqt.jax.v2.numerics import numerics
+from aqt.jax.v2.numerics import utils as numerics_utils
 import jax
 import jax.numpy as jnp
 
@@ -27,41 +30,92 @@ import jax.numpy as jnp
 AbstractAqtNumerics = numerics.AqtNumerics
 AbstractAqtCalibration = calibration.Calibration
 
+AxisTiling = tiled_dot_general.AxisTiling
+TilingState = tiled_dot_general.TilingState
+
 
 @utils.flax_slots_kw_only_dataclass
 class Quantizer:
   """Configuration of quantization of one tensor."""
 
   numerics: AbstractAqtNumerics = utils.static_field()
-  calib_shared_axes: Sequence[utils.AxisIdx] | Literal["per_tensor"] | None = (
+  calib_shared_axes: None | Sequence[utils.AxisIdx] | Literal["per_tensor"] = (
       utils.static_field()
   )
   scale_stop_grad: bool = utils.static_field()
+  scale_dtype: None | jnp.dtype = utils.static_field(default=None)
   # noise+clip+round
   # We apply gradient of clip_and_round in bwd pass.
-  calibration: type[AbstractAqtCalibration] = utils.static_field()
-  # Round up the calibration to power of 2 (po2).
-  po2_scale: bool = utils.static_field()
-  # TODO(yichizh): Factor out auxilliary dataclasses into a separate file.
+  calibration: None | type[AbstractAqtCalibration] = utils.static_field(
+      default=None
+  )
+  _calibrator: None | AbstractAqtCalibration = utils.static_field(default=None)
+  # TODO(yichizh): Factor out auxiliary dataclasses into a separate file.
   context: utils.Context
+
+  # we need to speed up this initialization for the backward pass to happen
+  # outside of bwd pass.
+  def init_calibration(self):
+    assert self._calibrator is None, "second call to self.init_calibration()"
+    if self.calibration is not None:
+      self._calibrator = self.calibration(dtype=self.scale_dtype)
+      self._calibrator.init_calibration()
 
   # TODO(yichizh): Need to add type annotation back to cfg.
   def quant(
       self,
       x,
       *,
-      calibration_axes,
+      calibration_axes: None | Sequence[utils.AxisIdx],
+      tiling_state: None | TilingState = None,
   ) -> tuple[aqt_tensor.QTensor, aqt_tensor.GradientFn]:
     """The core quantizing function."""
-    qt = self.calibrate(x, calibration_axes=calibration_axes)
+    qt = self.calibrate(
+        x, calibration_axes=calibration_axes, tiling_state=tiling_state
+    )
     qt, quant_grad = self.calculate_qvalue(x, qt)
     return qt, quant_grad
 
-  def calibrate(self, x, *, calibration_axes) -> aqt_tensor.QTensor:
-    """Create incomplete QTensor with only quantization parameters."""
+  def calibrate(
+      self,
+      x,
+      *,
+      calibration_axes: None | Sequence[utils.AxisIdx],
+      tiling_state: None | TilingState = None,
+  ) -> aqt_tensor.QTensor:
+    """Creates incomplete QTensor with only quantization parameters.
+
+    The tiling state is used to tile the input tensor and change the calibration
+    axes accordingly. When axis is tiled, it is split into multiple tiles. Each
+    tile shares the same quantization parameters like scale factor. On the other
+    hand, if the axis is not tiled, the whole axis shares the same quantization
+    parameters. This tiling will increase the granularity of calibration
+    reducing the numeric error from quantization.
+
+    Args:
+      x: The input tensor to be calibrated.
+      calibration_axes: The axes to calibrate.
+      tiling_state: The tiling state of the input tensor.
+
+    Returns:
+      An incomplete QTensor with only quantization parameters.
+    """
+
+    if tiling_state:
+      # Tile `x` and change calibration axes according to the tiling.
+      x = tiling_state.apply(x)
+      _, calibration_axes = tiling_state.to_tiled_axes_transposed(
+          calibration_axes
+      )
+
     if isinstance(self.numerics, no_numerics.NoNumerics):
       qt = aqt_tensor.QTensor(
-          qvalue=x, scale=[], scale_t=None, dequant_dtype=x.dtype
+          qvalue=x,
+          scale=[],
+          scale_t=None,
+          bias=[],
+          dequant_dtype=x.dtype,
+          tiling_state=tiling_state,
       )
       return qt
 
@@ -74,16 +128,15 @@ class Quantizer:
     else:
       shared_axes = self.calib_shared_axes or calibration_axes
 
-    calibrator = self.calibration()
-    bound = calibrator.get_bound(x, shared_axes, self.context)
-    abs_max_mapped_to = self.numerics.abs_val_mapped_to()
-    scale = bound / abs_max_mapped_to
-
-    if self.po2_scale:
-      # With floor the biggest value (we are using jnp.max) is in the range of
-      # clipping and therefore have a correct gradinet.
-      scale = 2 ** jnp.floor(jnp.log2(jax.lax.reciprocal(scale)))
-      scale = jax.lax.reciprocal(scale)
+    msg = (
+        f"{self.calibration = } must be set if {self.numerics = } is not"
+        " NoNumerics"
+    )
+    assert self.calibration is not None, msg
+    assert self._calibrator is not None, "forgot self.init_calibration()?"
+    scale, bias = self._calibrator.get_scale_and_bias(
+        x, shared_axes, self.numerics, self.context
+    )
     if self.scale_stop_grad:
       # TODO(lew): Does not matter in DG, because we are using custom gradient.
       #   We should take that into account somehow.
@@ -91,16 +144,16 @@ class Quantizer:
 
     qt = aqt_tensor.QTensor(
         qvalue=None,
-        scale=[scale],
+        scale=scale,
         scale_t=None,
+        bias=bias,
         dequant_dtype=dequant_dtype,
+        tiling_state=tiling_state,
     )
     return qt
 
   def calculate_qvalue(
-      self,
-      x,
-      qt: aqt_tensor.QTensor
+      self, x, qt: aqt_tensor.QTensor
   ) -> tuple[aqt_tensor.QTensor, aqt_tensor.GradientFn]:
     """Uses the quantization parameters in qt to quantize x."""
     if isinstance(self.numerics, no_numerics.NoNumerics):
@@ -115,37 +168,38 @@ class Quantizer:
     x_q, res = self.numerics.vjp_fwd(qt.qvalue, self.context)
     quant_grad = jax.tree_util.Partial(self.numerics.vjp_bwd, res)
 
-    qt = qt.replace(qvalue=x_q)
+    qt.qvalue = x_q
     return qt, quant_grad
 
 
 def quantizer_make(
-    n_bits: int | None, preserve_max_val: bool = False
+    n_bits: None | int | fp8_numerics.FP8Dtype,
+    preserve_max_val: bool = False,
+    initialize_calibration: bool = True,
+    scale_stop_grad: bool = True,
+    scale_dtype: None | jnp.dtype = None,
 ) -> Quantizer:
   """Makes Quantizer."""
+  effective_numerics = numerics_utils.get_numerics(n_bits, preserve_max_val)
+
   if n_bits is None:
-    effective_numerics = no_numerics.NoNumerics()
+    calibration_cls = None
   else:
-    pz = False if n_bits == 1 else True
-    dtype = utils.infer_dtype_from_bits(n_bits) if pz else None
-    effective_numerics = int_numerics.IntNumerics(
-        bits=n_bits,
-        preserve_zero=pz,
-        preserve_max_val=preserve_max_val,
-        clip=True,
-        round=True,
-        noise_fn=None,
-        clip_gradient=False,  # This can be disabled when using abs-max scaling.
-        dtype=dtype,
-    )
-  return Quantizer(
+    calibration_cls = calibration.AbsMaxCalibration
+
+  quantizer = Quantizer(
       numerics=effective_numerics,
       calib_shared_axes=None,
-      scale_stop_grad=True,
-      calibration=calibration.AbsMaxCalibration,
-      po2_scale=False,
+      scale_stop_grad=scale_stop_grad,
+      scale_dtype=scale_dtype,
+      calibration=calibration_cls,
       context=utils.Context(key=None, train_step=None),
   )
+  # TODO(lew): We should try to move to to class constructor or post-init.
+  # We currently need to call because bwd pass is too late for initialization.
+  if initialize_calibration:
+    quantizer.init_calibration()
+  return quantizer
 
 
 def make_fake_quant(quantizer: Quantizer, calibration_axes=None):

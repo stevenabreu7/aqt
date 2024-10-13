@@ -38,7 +38,7 @@ def _dummy_dataset(ds_size, image_rng, label_rng):
 class GptqTest(parameterized.TestCase):
 
   def test_gptq(self):
-    aqt_cfg = config.config_v4()
+    aqt_cfg_dg = config.config_v4()
 
     # RNGs
     rng = jax.random.key(0)
@@ -54,15 +54,16 @@ class GptqTest(parameterized.TestCase):
     ds = _dummy_dataset(ds_size, image_rng, label_rng)
 
     # Stage 1: regular training
-    state = gptq_flax_e2e_model.create_train_state(init_rng, aqt_cfg)
+    state = gptq_flax_e2e_model.create_train_state(
+        init_rng, aqt_cfg_dg=aqt_cfg_dg)
 
     state, _, _ = gptq_flax_e2e_model.train_epoch(
         state, ds, batch_size, rng=input_rng
     )
 
     # Stage 2: Calibration.
-    gptq_flax_e2e_model.update_cfg_with_gptq(state.cnn_train.aqt_cfg)
-    gptq_flax_e2e_model.update_cfg_with_gptq(state.cnn_eval.aqt_cfg)
+    gptq_flax_e2e_model.update_cfg_with_gptq(state.cnn_train.aqt_cfg_dg)
+    gptq_flax_e2e_model.update_cfg_with_gptq(state.cnn_eval.aqt_cfg_dg)
 
     calibrate_f, model_calibrate = gptq_flax_e2e_model.calibration_conversion(
         state
@@ -118,7 +119,7 @@ class GptqTest(parameterized.TestCase):
 
     # Stage 3. Convert the calibrated checkpoint.
     state = state.replace(model=copy.deepcopy(calibrated_params))
-    serve_fn, model_serving = gptq_flax_e2e_model.serving_conversion(state)
+    _, model_serving = gptq_flax_e2e_model.serving_conversion(state)
     dtype = jnp.dtype
     expected_dtype = dtype("int8")
     expected_aqt_pytree = {
@@ -126,10 +127,11 @@ class GptqTest(parameterized.TestCase):
             "AqtDotGeneral_0": {
                 "qlhs": {
                     "frozen": aqt_tensor.QTensor(
-                        qvalue=(expected_dtype, (1, 2, 5, 1, 10)),
-                        scale=[(dtype("float32"), (1, 2, 1, 1, 10))],
+                        qvalue=(expected_dtype, (2, 5, 10)),
+                        scale=[(dtype("float32"), (2, 1, 10))],
                         scale_t=None,
-                        dequant_dtype=dtype("float32")
+                        bias=[],
+                        dequant_dtype=dtype("float32"),
                     )
                 },
             }
@@ -138,10 +140,11 @@ class GptqTest(parameterized.TestCase):
             "AqtDotGeneral_0": {
                 "qrhs": {
                     "frozen": aqt_tensor.QTensor(
-                        qvalue=(expected_dtype, (1, 2, 1568, 1, 256)),
-                        scale=[(dtype("float32"), (1, 2, 1, 1, 256))],
+                        qvalue=(expected_dtype, (2, 1568, 256)),
+                        scale=[(dtype("float32"), (2, 1, 256))],
                         scale_t=None,
-                        dequant_dtype=dtype("float32")
+                        bias=[],
+                        dequant_dtype=dtype("float32"),
                     )
                 }
             }
@@ -150,14 +153,15 @@ class GptqTest(parameterized.TestCase):
             "AqtDotGeneral_0": {
                 "qrhs": {
                     "frozen": aqt_tensor.QTensor(
-                        qvalue=(expected_dtype, (1, 2, 128, 1, 10)),
-                        scale=[(dtype("float32"), (1, 2, 1, 1, 10))],
+                        qvalue=(expected_dtype, (2, 128, 10)),
+                        scale=[(dtype("float32"), (2, 1, 10))],
                         scale_t=None,
-                        dequant_dtype=dtype("float32")
+                        bias=[],
+                        dequant_dtype=dtype("float32"),
                     )
                 }
             }
-        }
+        },
     }
 
     serving_pytree = jax.tree_util.tree_map(
@@ -166,19 +170,9 @@ class GptqTest(parameterized.TestCase):
 
     utils.test_pprint_eq(expected_aqt_pytree, serving_pytree["aqt"])
 
-    # Compare logits of models before conversion and after conversion.
-    def forward(model, apply_fn):
-      return apply_fn(
-          model,
-          ds["image"],
-          rngs={"params": jax.random.PRNGKey(0)},
-          mutable=True,
-      )
-
-    logits_before_conversion, _ = forward(state.model, state.cnn_eval.apply)
-    logits_after_conversion, _ = forward(model_serving, serve_fn)
-
-    assert (logits_before_conversion == logits_after_conversion).all()
+    # Since the GPTQ changes the weights to better quantize it, the logits
+    # before and after the conversion should be different.
+    # As a conclusion, we do not put the logits comparison tests here.
 
 
 if __name__ == "__main__":

@@ -13,22 +13,23 @@
 # limitations under the License.
 """Configuration dataclasses."""
 
+# pylint: disable=g-importing-member
+# pylint: disable=unused-import
+# pylint: disable=g-explicit-bool-comparison
 
 import copy
 import functools
-from typing import Literal, Optional, TypeAlias, Union
+from typing import Literal, TypeAlias
+
 from aqt.jax.v2 import aqt_dot_general
 from aqt.jax.v2 import aqt_quantizer
 from aqt.jax.v2 import calibration
 from aqt.jax.v2 import stochastic_rounding
 from aqt.jax.v2 import utils
-
 # Temporary re-export from aqt.jax.v2.aqt_dot_general
 # TODO(lew): Remove these imports, use setters instead
-# pylint: disable=g-importing-member
-# pylint: disable=unused-import
+from aqt.jax.v2.aqt_conv_general import conv_general_dilated_make
 from aqt.jax.v2.aqt_dot_general import CalibrationMode
-from aqt.jax.v2.aqt_dot_general import conv_general_dilated_make
 from aqt.jax.v2.aqt_dot_general import DequantMode
 from aqt.jax.v2.aqt_dot_general import dot_general_make
 from aqt.jax.v2.aqt_dot_general import dot_general_raw_make
@@ -37,15 +38,16 @@ from aqt.jax.v2.aqt_dot_general import DotGeneralRaw
 from aqt.jax.v2.aqt_dot_general import dtypes_allowed_for_int32_accum
 from aqt.jax.v2.aqt_dot_general import LocalAqt
 from aqt.jax.v2.aqt_dot_general import Tensor
-
 from aqt.jax.v2.aqt_quantizer import quantizer_make
-
 from aqt.jax.v2.numerics import fp8_numerics
+from aqt.jax.v2.numerics import fp_numerics
 from aqt.jax.v2.numerics import int_numerics
 from aqt.jax.v2.numerics import no_numerics
 from aqt.jax.v2.numerics import numerics
+from aqt.jax.v2.numerics import utils as numerics_utils
 import jax
 import jax.numpy as jnp
+
 
 ################################################################################
 # Functions below are auxiliary config attribute setters.
@@ -56,21 +58,21 @@ SKIP = 'skip'
 SkipT: TypeAlias = Literal[SKIP]
 
 
-def _split_key(key: Optional[jax.Array], num_splits: int):
+def _split_key(key: None | jax.Array, num_splits: int):
   default = (None,) * num_splits
   return default if key is None else jax.random.split(key, num_splits)
 
 
 def set_context(
     cfg: DotGeneral,
-    key: Optional[jax.Array],
-    train_step: Optional[int],
+    key: None | jax.Array,
+    train_step: None | int,
     lhs_quant_mode: utils.QuantMode = utils.QuantMode.TRAIN,
     rhs_quant_mode: utils.QuantMode = utils.QuantMode.TRAIN,
 ):
   """Set context with prng keys and train_steps for dot_general config."""
 
-  def set_dg_raw_context(cfg_raw: DotGeneralRaw, key: Optional[jax.Array]):
+  def set_dg_raw_context(cfg_raw: DotGeneralRaw, key: None | jax.Array):
     key1, key2 = _split_key(key, num_splits=2)
     lhs_context = utils.Context(
         key=key1, train_step=train_step, quant_mode=lhs_quant_mode
@@ -91,8 +93,8 @@ def set_context(
 def set_fwd_dequant_mode(
     cfg: DotGeneral,
     *,
-    lhs_dequant_mode: Optional[DequantMode] = None,
-    rhs_dequant_mode: Optional[DequantMode] = None,
+    lhs_dequant_mode: None | DequantMode = None,
+    rhs_dequant_mode: None | DequantMode = None,
 ):
   if lhs_dequant_mode is not None:
     cfg.fwd.lhs.dequant_mode = lhs_dequant_mode
@@ -137,11 +139,26 @@ def set_numerics(
     cfg.dg_accumulator_dtype = None
 
 
+def set_fwd_rhs_dtype_int2(cfg: DotGeneral):
+  """A special setter for int2 weights."""
+  # Since XLA only supports int2 casting with an input shape of a multiple
+  # of 128, we use this setter to enable int2 dtype.
+  # Remove this setter and enable int2 in utils.infer_dtype_from_bits()
+  # when XLA supports general int2 casting.
+  assert isinstance(
+      cfg.fwd.dg_quantizer.rhs.numerics, int_numerics.IntSymmetric
+  )
+  assert cfg.fwd.dg_quantizer.rhs.numerics.bits == 2
+  # Disable pytype check since jnp.int2 is only dynamically to jax
+  # when ml_dtypes package has it.
+  cfg.fwd.dg_quantizer.rhs.numerics.dtype = jnp.int2  # pytype: disable=module-attr
+
+
 def set_accumulator_dtype(
     cfg: DotGeneral,
-    fwd_dtype: Union[jnp.dtype, None, SkipT],
-    dlhs_dtype: Union[jnp.dtype, None, SkipT],
-    drhs_dtype: Union[jnp.dtype, None, SkipT],
+    fwd_dtype: None | jnp.dtype | SkipT,
+    dlhs_dtype: None | jnp.dtype | SkipT,
+    drhs_dtype: None | jnp.dtype | SkipT,
 ):
   if fwd_dtype != SKIP:
     cfg.fwd.dg_accumulator_dtype = fwd_dtype
@@ -200,10 +217,12 @@ def set_stochastic_rounding(
   _set_numerics_noise_fn(cfg.drhs.dg_quantizer, is_lhs_sr, is_rhs_sr)
 
 
-def set_static_bound(cfg: DotGeneral, bound: float = 1.0):
+def set_constant_calibration(
+    cfg: DotGeneral, bound: float = 1.0, bias: None | float = None
+):
   """Sets the static bound for calibration."""
   calibration_cls = functools.partial(
-      calibration.ConstantCalibration, bound=bound
+      calibration.ConstantCalibration, bound=bound, bias=bias
   )
 
   assert isinstance(
@@ -226,9 +245,9 @@ def set_static_bound(cfg: DotGeneral, bound: float = 1.0):
 
 def set_local_aqt(
     cfg: DotGeneral,
-    fwd_local_aqt: Union[SkipT, LocalAqt, None],
-    dlhs_local_aqt: Union[SkipT, LocalAqt, None],
-    drhs_local_aqt: Union[SkipT, LocalAqt, None],
+    fwd_local_aqt: None | SkipT | LocalAqt,
+    dlhs_local_aqt: None | SkipT | LocalAqt,
+    drhs_local_aqt: None | SkipT | LocalAqt,
 ):
   if fwd_local_aqt != SKIP:
     cfg.fwd.local_aqt = fwd_local_aqt
@@ -240,13 +259,84 @@ def set_local_aqt(
 
 def set_use_fwd_quant(
     cfg: DotGeneral,
-    dlhs_use_fwd_quant: Union[bool, None, SkipT],
-    drhs_use_fwd_quant: Union[bool, None, SkipT],
+    dlhs_use_fwd_quant: None | bool | SkipT,
+    drhs_use_fwd_quant: None | bool | SkipT,
 ):
+  """Enable resusing of fwd pass quantization for backprop."""
+  msg = 'use_fwd_quant is incompatible with use_mid_quant right now.'
+  assert cfg.fwd.dg_quantizer.lhs_mid_alpha is None, msg
+  assert cfg.fwd.dg_quantizer.rhs_mid_alpha is None, msg
+  assert cfg.dlhs.dg_quantizer.lhs_mid_alpha is None, msg
+  assert cfg.dlhs.dg_quantizer.rhs_mid_alpha is None, msg
+  assert cfg.drhs.dg_quantizer.lhs_mid_alpha is None, msg
+  assert cfg.drhs.dg_quantizer.rhs_mid_alpha is None, msg
   if dlhs_use_fwd_quant != SKIP:
     cfg.dlhs.rhs.use_fwd_quant = dlhs_use_fwd_quant
   if drhs_use_fwd_quant != SKIP:
     cfg.drhs.rhs.use_fwd_quant = drhs_use_fwd_quant
+
+
+def set_use_mid_quant(
+    cfg: DotGeneral,
+    fwd_mid_alpha_both: SkipT | float,
+    dlhs_mid_alpha_both: SkipT | float,
+    drhs_mid_alpha_both: SkipT | float,
+):
+  """Enable middle quantization. Variant of SmoothQuant / AWQ."""
+  assert isinstance(
+      cfg.fwd.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+  )
+  assert isinstance(
+      cfg.dlhs.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+  )
+  assert isinstance(
+      cfg.drhs.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+  )
+
+  msg = 'use_fwd_quant is incompatible with use_mid_quant right now.'
+  assert not cfg.dlhs.rhs.use_fwd_quant, msg
+  assert not cfg.drhs.rhs.use_fwd_quant, msg
+
+  @utils.flax_slots_kw_only_dataclass
+  class DummyNumerics(numerics.AqtNumerics):
+    """DummyNumerics for mid-quantization."""
+
+    def get_quant_bound(self):
+      return 1.0
+
+    def get_dtype(self):
+      assert False, 'Should not request dtype for mid-quantization.'
+
+    def vjp_fwd(self, x, context):
+      res = ()
+      return x, res
+
+    def vjp_bwd(self, res, grad):
+      assert res == ()
+      return grad
+
+  calibration_cls = calibration.AbsMaxCalibration
+  if fwd_mid_alpha_both != SKIP:
+    cfg.fwd.dg_quantizer.lhs_mid.numerics = DummyNumerics()
+    cfg.fwd.dg_quantizer.rhs_mid.numerics = DummyNumerics()
+    cfg.fwd.dg_quantizer.lhs_mid.calibration = calibration_cls
+    cfg.fwd.dg_quantizer.rhs_mid.calibration = calibration_cls
+    cfg.fwd.dg_quantizer.lhs_mid_alpha = fwd_mid_alpha_both
+    cfg.fwd.dg_quantizer.rhs_mid_alpha = fwd_mid_alpha_both
+  if dlhs_mid_alpha_both != SKIP:
+    cfg.dlhs.dg_quantizer.lhs_mid.numerics = DummyNumerics()
+    cfg.dlhs.dg_quantizer.rhs_mid.numerics = DummyNumerics()
+    cfg.dlhs.dg_quantizer.lhs_mid.calibration = calibration_cls
+    cfg.dlhs.dg_quantizer.rhs_mid.calibration = calibration_cls
+    cfg.dlhs.dg_quantizer.lhs_mid_alpha = dlhs_mid_alpha_both
+    cfg.dlhs.dg_quantizer.rhs_mid_alpha = dlhs_mid_alpha_both
+  if drhs_mid_alpha_both != SKIP:
+    cfg.drhs.dg_quantizer.lhs_mid.numerics = DummyNumerics()
+    cfg.drhs.dg_quantizer.rhs_mid.numerics = DummyNumerics()
+    cfg.drhs.dg_quantizer.lhs_mid.calibration = calibration_cls
+    cfg.drhs.dg_quantizer.rhs_mid.calibration = calibration_cls
+    cfg.drhs.dg_quantizer.lhs_mid_alpha = drhs_mid_alpha_both
+    cfg.drhs.dg_quantizer.rhs_mid_alpha = drhs_mid_alpha_both
 
 
 def set_int_numerics_preserve_zero(cfg: DotGeneral, preserve_zero: bool):
@@ -264,18 +354,64 @@ def set_int_numerics_preserve_zero(cfg: DotGeneral, preserve_zero: bool):
   for dot_general_raw in [cfg.fwd, cfg.dlhs, cfg.drhs]:
     dg_quantizer = dot_general_raw.dg_quantizer
     for q_numerics in [dg_quantizer.lhs.numerics, dg_quantizer.rhs.numerics]:
-      if isinstance(q_numerics, int_numerics.IntNumerics):
+      if isinstance(q_numerics, int_numerics.IntSymmetric):
         q_numerics.preserve_zero = preserve_zero
         updated_dtype = (
-            utils.infer_dtype_from_bits(q_numerics.bits)  # pytype: disable=attribute-error
+            utils.infer_dtype_from_bits(q_numerics.bits)
             if preserve_zero
             else None
         )
         q_numerics.dtype = updated_dtype
 
 
+def set_auto_calib_scale(
+    cfg: DotGeneral, auto_clip_search_config: utils.AutoScaleSearchConfig
+) -> None:
+  """Update `cfg`'s quantizers' calibration to use auto clipping search.
+
+  Currently only supports the weights (rhs) of `DotGeneral`, since the iterative
+  process of finding the scale tensors might be too slow for the activations
+  (lhs).
+
+  Args:
+    cfg: The config to be updated.
+    auto_clip_search_config: The config for auto clipping search.
+  """
+  assert isinstance(
+      cfg.fwd.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+  )
+  assert isinstance(
+      cfg.dlhs.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+  )
+  assert isinstance(
+      cfg.drhs.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+  )
+
+  for dot_general_raw in [cfg.fwd, cfg.dlhs, cfg.drhs]:
+    quantizer = dot_general_raw.dg_quantizer.rhs
+    # TODO(lew): Remove partial inspection wherever possible.
+    # Partial inspection is needed because the current implementation of delayed
+    # calibration initialization requires the configuration to be set via
+    # functools.partial.
+    keywords = {}
+    if isinstance(quantizer.calibration, functools.partial):
+      keywords = quantizer.calibration.keywords
+    keywords.update(auto_clip_search_config=auto_clip_search_config)
+    quantizer.calibration = functools.partial(
+        calibration.SnrBasedAutoCalibration, **keywords
+    )
+
+
 def set_absmax_calib_scale(cfg: DotGeneral, scale: float):
-  """Set AbsMaxCalibration scale and update clip_gradient accordingly."""
+  """Set clipping_scale and clip_gradient for AbsMaxCalibration quantizers.
+
+  Does not modify the configuration for quantizers with other calibration
+  classes or None calibration.
+
+  Args:
+    cfg: The config to be updated.
+    scale: The clipping scale.
+  """
   assert isinstance(
       cfg.fwd.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
   )
@@ -290,60 +426,74 @@ def set_absmax_calib_scale(cfg: DotGeneral, scale: float):
     dg_quantizer = dot_general_raw.dg_quantizer
     for quantizer in [dg_quantizer.lhs, dg_quantizer.rhs]:
       calibration_cls = quantizer.calibration
+      if calibration_cls is None:
+        continue
+
+      # TODO(lew): Remove partial inspection wherever possible.
+      # Partial inspection is needed because the current implementation of
+      # delayed calibration initialization requires the configuration to be set
+      # via functools.partial.
+      keywords = {}
       if isinstance(calibration_cls, functools.partial):
+        keywords = calibration_cls.keywords
         calibration_cls = calibration_cls.func
+      keywords.update(clipping_scale=scale)
       assert calibration_cls == calibration.AbsMaxCalibration, (
-          'scale is only available in AbsMaxCalibration, while'
+          'clipping_scale is only available in AbsMaxCalibration, while'
           f' {quantizer.calibration} is used in current config.'
       )
       quantizer.calibration = functools.partial(
-          calibration.AbsMaxCalibration, scale=scale
+          calibration.AbsMaxCalibration,
+          **keywords,
       )
       if scale < 1.0 and isinstance(
-          quantizer.numerics, int_numerics.IntNumerics
+          quantizer.numerics, int_numerics.IntSymmetric
       ):
         quantizer.numerics.clip_gradient = True
 
 
 def set_bits(
     cfg: DotGeneral,
-    fwd_lhs_bit: Union[int, None, fp8_numerics.FP8Dtype],
-    fwd_rhs_bit: Union[int, None, fp8_numerics.FP8Dtype],
-    dlhs_lhs_bit: Union[int, None, fp8_numerics.FP8Dtype],
-    dlhs_rhs_bit: Union[int, None, fp8_numerics.FP8Dtype],
-    drhs_lhs_bit: Union[int, None, fp8_numerics.FP8Dtype],
-    drhs_rhs_bit: Union[int, None, fp8_numerics.FP8Dtype],
+    fwd_lhs_bit: None | int | fp8_numerics.FP8Dtype,
+    fwd_rhs_bit: None | int | fp8_numerics.FP8Dtype,
+    dlhs_lhs_bit: None | int | fp8_numerics.FP8Dtype,
+    dlhs_rhs_bit: None | int | fp8_numerics.FP8Dtype,
+    drhs_lhs_bit: None | int | fp8_numerics.FP8Dtype,
+    drhs_rhs_bit: None | int | fp8_numerics.FP8Dtype,
 ) -> DotGeneral:
-  """Set quantization bits for dot_general config."""
+  """Set quant bits for dot_general. Overwrites with AbsMaxCalibration."""
+  calibration_cls = calibration.AbsMaxCalibration
 
-  def get_numerics(bits):
-    if bits is None:
-      effective_numerics = no_numerics.NoNumerics()
-    elif bits in fp8_numerics.fp8_map.keys():
-      exponent_bits, mantissa_bits = int(bits[1]), int(bits[3])
-      effective_numerics = fp8_numerics.Fp8Numerics(
-          exponent_bits=exponent_bits,
-          mantissa_bits=mantissa_bits,
-          dtype=fp8_numerics.fp8_map[bits],
-      )
-    else:
-      pz = False if bits == 1 else True
-      dtype = utils.infer_dtype_from_bits(bits) if pz else None
-      effective_numerics = int_numerics.IntNumerics(
-          bits=bits,
-          preserve_zero=pz,
-          preserve_max_val=False,
-          clip=True,
-          round=True,
-          noise_fn=None,
-          clip_gradient=False,  # Can be disabled when using abs-max scaling.
-          dtype=dtype,
-      )
-    return effective_numerics
+  set_numerics(
+      cfg.fwd,
+      numerics_utils.get_numerics(fwd_lhs_bit),
+      numerics_utils.get_numerics(fwd_rhs_bit),
+  )
+  if fwd_lhs_bit is not None:
+    cfg.fwd.dg_quantizer.lhs.calibration = calibration_cls
+  if fwd_rhs_bit is not None:
+    cfg.fwd.dg_quantizer.rhs.calibration = calibration_cls
 
-  set_numerics(cfg.fwd, get_numerics(fwd_lhs_bit), get_numerics(fwd_rhs_bit))
-  set_numerics(cfg.dlhs, get_numerics(dlhs_lhs_bit), get_numerics(dlhs_rhs_bit))
-  set_numerics(cfg.drhs, get_numerics(drhs_lhs_bit), get_numerics(drhs_rhs_bit))
+  set_numerics(
+      cfg.dlhs,
+      numerics_utils.get_numerics(dlhs_lhs_bit),
+      numerics_utils.get_numerics(dlhs_rhs_bit),
+  )
+  if dlhs_lhs_bit is not None:
+    cfg.dlhs.dg_quantizer.lhs.calibration = calibration_cls
+  if dlhs_rhs_bit is not None:
+    cfg.dlhs.dg_quantizer.rhs.calibration = calibration_cls
+
+  set_numerics(
+      cfg.drhs,
+      numerics_utils.get_numerics(drhs_lhs_bit),
+      numerics_utils.get_numerics(drhs_rhs_bit),
+  )
+  if drhs_lhs_bit is not None:
+    cfg.drhs.dg_quantizer.lhs.calibration = calibration_cls
+  if drhs_rhs_bit is not None:
+    cfg.drhs.dg_quantizer.rhs.calibration = calibration_cls
+
   # use_fwd_quant is by default set to False if fwd pass is quantized.
   # This is to make the configuration logically correct,
   # i.e., use_fwd_quant cannot be None when fwd is quantized.
@@ -352,6 +502,42 @@ def set_bits(
   drhs_use_fwd_quant = False if fwd_lhs_bit is not None else SKIP
   set_use_fwd_quant(cfg, dlhs_use_fwd_quant, drhs_use_fwd_quant)
   return cfg
+
+
+def set_scale_and_bias_dtype(cfg: DotGeneral, dtype: jnp.dtype):
+  """Set the dtype for all scales and biases in the given DotGeneral config."""
+  assert isinstance(
+      cfg.fwd.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+  )
+  assert isinstance(
+      cfg.dlhs.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+  )
+  assert isinstance(
+      cfg.drhs.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer
+  )
+
+  def _update_dtype(quantizer: aqt_quantizer.Quantizer):
+    calibration_cls = quantizer.calibration
+    if calibration_cls is None:
+      return
+
+    # TODO(lew): Remove partial inspection wherever possible.
+    # Partial inspection is needed because the current implementation of delayed
+    # calibration initialization requires the configuration to be set via
+    # functools.partial.
+    keywords = {}
+    if isinstance(calibration_cls, functools.partial):
+      keywords = calibration_cls.keywords
+      calibration_cls = calibration_cls.func
+    keywords.update(dtype=dtype)
+    quantizer.calibration = functools.partial(calibration_cls, **keywords)
+
+  _update_dtype(cfg.fwd.dg_quantizer.lhs)
+  _update_dtype(cfg.fwd.dg_quantizer.rhs)
+  _update_dtype(cfg.dlhs.dg_quantizer.lhs)
+  _update_dtype(cfg.dlhs.dg_quantizer.rhs)
+  _update_dtype(cfg.drhs.dg_quantizer.lhs)
+  _update_dtype(cfg.drhs.dg_quantizer.rhs)
 
 
 ################################################################################
@@ -374,8 +560,7 @@ def default_unquantized_config() -> DotGeneral:
         numerics=no_numerics.NoNumerics(),
         calib_shared_axes=None,
         scale_stop_grad=True,
-        calibration=calibration.AbsMaxCalibration,
-        po2_scale=False,
+        calibration=None,
         context=utils.Context(key=None, train_step=None),
     )
 
@@ -384,7 +569,10 @@ def default_unquantized_config() -> DotGeneral:
         lhs=tensor_cfg(),
         rhs=tensor_cfg(),
         dg_quantizer=aqt_dot_general.DefaultDotGeneralQuantizer(
-            lhs=quantizer(), rhs=quantizer()
+            lhs=quantizer(),
+            rhs=quantizer(),
+            lhs_mid=quantizer(),
+            rhs_mid=quantizer(),
         ),
         dg_accumulator_dtype=None,
         local_aqt=None,
@@ -401,19 +589,19 @@ def default_unquantized_config() -> DotGeneral:
 
 def fully_quantized(
     *,
-    fwd_bits: Optional[Union[int, tuple[int]]] = 8,
-    bwd_bits: Optional[int] = 8,
+    fwd_bits: None | int = 8,
+    bwd_bits: None | int = 8,
     use_fwd_quant: bool = True,
-    use_stochastic_rounding: Optional[bool] = True,
+    use_stochastic_rounding: None | bool = True,
     # Typically we have (but it's a caller's responsibility to check):
     # - vjp_lhs_stochastic_rounding is referring to the gradient and
     # - vjp_rhs_stochastic_rounding is referring to the activations/weights.
-    vjp_lhs_stochastic_rounding: Optional[bool] = None,
-    vjp_rhs_stochastic_rounding: Optional[bool] = None,
+    vjp_lhs_stochastic_rounding: None | bool = None,
+    vjp_rhs_stochastic_rounding: None | bool = None,
     # The dummy static bound flag is temporary, for performance benchmarking.
     use_dummy_static_bound: bool = False,
-    dlhs_local_aqt: Optional[LocalAqt] = None,
-    drhs_local_aqt: Optional[LocalAqt] = None,
+    dlhs_local_aqt: None | LocalAqt = None,
+    drhs_local_aqt: None | LocalAqt = None,
     # new flag for which calibration mode to use
     calibration_mode: CalibrationMode = CalibrationMode.CONTRACTING_AXIS,
 ) -> DotGeneral:
@@ -462,7 +650,7 @@ def fully_quantized(
     set_stochastic_rounding(cfg, False, True, 'jax.uniform')
 
   if use_dummy_static_bound:
-    set_static_bound(cfg, 1.0)
+    set_constant_calibration(cfg, 1.0)
 
   assert cfg.fwd.local_aqt is None, 'local_aqt is not yet supported in fwd.'
 
@@ -471,38 +659,45 @@ def fully_quantized(
 
 def config_v3(
     *,
-    fwd_bits: Optional[int] = 8,
-    dlhs_bits: Optional[int] = 8,
-    drhs_bits: Optional[int] = None,
+    fwd_bits: None | int = 8,
+    dlhs_bits: None | int = 8,
+    drhs_bits: None | int = None,
     # The dummy static bound flag is for performance benchmarking.
     use_dummy_static_bound: bool = False,
     rng_type: str = 'jax.uniform',  # 'custom-1'
-    dlhs_local_aqt: Optional[LocalAqt] = None,
-    drhs_local_aqt: Optional[LocalAqt] = None,
+    dlhs_local_aqt: None | LocalAqt = None,
+    drhs_local_aqt: None | LocalAqt = None,
     fwd_accumulator_dtype: ... = jnp.int32,
     dlhs_accumulator_dtype: ... = jnp.int32,
     drhs_accumulator_dtype: ... = None,
 ) -> DotGeneral:
   """Fully Quantized Training."""
-  fwd = dot_general_raw_make(fwd_bits, fwd_bits, jax_scope_name='aqt_fwd')
+  fwd = dot_general_raw_make(
+      fwd_bits,
+      fwd_bits,
+      jax_scope_name='aqt_fwd',
+      initialize_calibration=False,
+  )
   dlhs = dot_general_raw_make(
       dlhs_bits,
       dlhs_bits,
       local_aqt=dlhs_local_aqt,
       jax_scope_name='aqt_dlhs',
+      initialize_calibration=False,
   )
   drhs = dot_general_raw_make(
       drhs_bits,
       drhs_bits,
       local_aqt=drhs_local_aqt,
       jax_scope_name='aqt_drhs',
+      initialize_calibration=False,
   )
   cfg = DotGeneral(fwd=fwd, dlhs=dlhs, drhs=drhs)
 
   cfg.dlhs.rhs.use_fwd_quant = False
   cfg.drhs.rhs.use_fwd_quant = False
 
-  # Typically we have (but I don't know if it is guraranteed):
+  # Typically we have (but I don't know if it is guaranteed):
   # - vjp_lhs_stochastic_rounding is referring to the gradient and
   # - vjp_rhs_stochastic_rounding is referring to the activations/weights.
   set_stochastic_rounding(
@@ -513,7 +708,7 @@ def config_v3(
   )
 
   if use_dummy_static_bound:
-    set_static_bound(cfg, 1.0)
+    set_constant_calibration(cfg, 1.0)
 
   set_accumulator_dtype(
       cfg,
@@ -527,21 +722,24 @@ def config_v3(
 
 def config_v4(
     *,
-    fwd_bits: Union[int, None, fp8_numerics.FP8Dtype] = 8,
-    dlhs_bits: Union[int, None, fp8_numerics.FP8Dtype] = 8,
-    drhs_bits: Union[int, None, fp8_numerics.FP8Dtype] = None,
+    fwd_bits: None | int | fp8_numerics.FP8Dtype = 8,
+    dlhs_bits: None | int | fp8_numerics.FP8Dtype = 8,
+    drhs_bits: None | int | fp8_numerics.FP8Dtype = None,
     # The dummy static bound flag is for performance benchmarking.
     use_dummy_static_bound: bool = False,
     rng_type: str = 'jax.uniform',  # 'custom-1'
-    dlhs_local_aqt: Optional[LocalAqt] = None,
-    drhs_local_aqt: Optional[LocalAqt] = None,
+    dlhs_local_aqt: None | LocalAqt = None,
+    drhs_local_aqt: None | LocalAqt = None,
     # accumulator dtype by default is automatically set in set_bits,
     # but users can still configure a special dtype such as jnp.int16, etc.
-    fwd_accumulator_dtype: Union[jnp.dtype, None, SkipT] = SKIP,
-    dlhs_accumulator_dtype: Union[jnp.dtype, None, SkipT] = SKIP,
-    drhs_accumulator_dtype: Union[jnp.dtype, None, SkipT] = SKIP,
-    dlhs_use_fwd_quant: Union[bool, None, SkipT] = SKIP,
-    drhs_use_fwd_quant: Union[bool, None, SkipT] = SKIP,
+    fwd_accumulator_dtype: None | jnp.dtype | SkipT = SKIP,
+    dlhs_accumulator_dtype: None | jnp.dtype | SkipT = SKIP,
+    drhs_accumulator_dtype: None | jnp.dtype | SkipT = SKIP,
+    dlhs_use_fwd_quant: None | bool | SkipT = SKIP,
+    drhs_use_fwd_quant: None | bool | SkipT = SKIP,
+    fwd_mid_alpha_both: SkipT | float = SKIP,
+    dlhs_mid_alpha_both: SkipT | float = SKIP,
+    drhs_mid_alpha_both: SkipT | float = SKIP,
 ) -> DotGeneral:
   """Version 4 of user-visible AQT config."""
   cfg = default_unquantized_config()
@@ -567,7 +765,7 @@ def config_v4(
       implementation=rng_type,
   )
   if use_dummy_static_bound:
-    set_static_bound(cfg, 1.0)
+    set_constant_calibration(cfg, 1.0)
   set_local_aqt(
       cfg,
       fwd_local_aqt=SKIP,
@@ -578,6 +776,12 @@ def config_v4(
       cfg,
       dlhs_use_fwd_quant=dlhs_use_fwd_quant,
       drhs_use_fwd_quant=drhs_use_fwd_quant,
+  )
+  set_use_mid_quant(
+      cfg,
+      fwd_mid_alpha_both=fwd_mid_alpha_both,
+      dlhs_mid_alpha_both=dlhs_mid_alpha_both,
+      drhs_mid_alpha_both=drhs_mid_alpha_both,
   )
   assert cfg.fwd.local_aqt is None, 'local_aqt is not yet supported in fwd.'
   return cfg
@@ -603,10 +807,7 @@ def config_fwd_fp8(fwd_bits: fp8_numerics.FP8Dtype = 'e4m3') -> DotGeneral:
   return cfg
 
 
-def set_fwd_calibration(
-    cfg: DotGeneral,
-    calibration_factory
-) -> DotGeneral:
+def set_fwd_calibration(cfg: DotGeneral, calibration_factory) -> DotGeneral:
   """Updates aqt_cfg for static range calibration."""
   assert isinstance(
       cfg.fwd.dg_quantizer, aqt_dot_general.DefaultDotGeneralQuantizer

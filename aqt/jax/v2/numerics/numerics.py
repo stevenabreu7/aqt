@@ -14,24 +14,34 @@
 """Base abstract class for all numerics."""
 import abc
 
+from aqt.jax.v2 import utils
 
+
+@utils.flax_slots_kw_only_dataclass
 class AqtNumerics(abc.ABC):
-  """Numerics for int8, int4, binary, etc."""
-
-  # TODO(lew): Currently this is a part of API, only because it is used to set
-  # it in test. Remove and leave only get_dtype(
+  """Abstract class for various quantization numerics."""
 
   @abc.abstractmethod
   def get_dtype(self):
     pass
 
   @abc.abstractmethod
-  def abs_val_mapped_to(self):
-    """The value returned is the end of quantization range.
+  def get_quant_bound(self):
+    """The width that the bound corresponds to in the quantization range.
+
+    For symmetric scaling (relative to a fixed zero point), the bound represents
+    the largest absolute value that should be representable in the input tensor,
+    and the quant_bound represents where that corresponds to in the
+    quantization range.
 
     It could be biggest value that can be represented by numerical format
-    exactly. E.g. in case of int8, 127 . Or it could be edge of the last bucket.
-    Edge in case of int8, 127.5
+    exactly (e.g. in case of int8, 127), or it could be edge of the last bucket
+    (e.g. in case of int8, 127.5. In this case the largest representable
+    absolute value will be slightly smaller than the bound).
+
+    For asymmetric scaling, the bound corresponds to the width of the entire
+    input tensor, and the quant_bound corresponds to the width of the entire
+    quantization range (e.g. in case of int8, 255).
     """
     pass
 

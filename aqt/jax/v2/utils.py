@@ -18,12 +18,13 @@ However, it is acceptable to grow pieces of funcionality in this file and later
 promote them to dedicated files.
 """
 
+import dataclasses
 import difflib
 import enum
 import functools
 import pprint
 import re
-from typing import Any, Sequence
+from typing import Any, Sequence, TypeAlias
 import flax.struct
 import jax
 from jax import numpy as jnp
@@ -34,10 +35,14 @@ AxisIdx = int
 AxisSize = int
 
 # None means that the template matches any axis size
-ShapeTemplate = Sequence[int | None]
+ShapeTemplate = Sequence[None |int]
 
 # TODO(lew): We should get a better type for jax.lax.dot_general and variants.
 DotGeneralT = Any
+
+# Specifies the scale values to search for. Used with `SnrBasedAutoCalibration`
+# for auto scale search.
+AutoScaleSearchConfig: TypeAlias = Sequence[float]
 
 
 def assert_shape(shape: Sequence[int], shape_template: ShapeTemplate, msg: str):
@@ -68,6 +73,15 @@ flax_slots_kw_only_dataclass = functools.partial(
 )
 
 
+def dataclass_field(default='no default value'):
+  # We can't use None as the default's default,
+  # because someone actually might want to have None as default of the field.
+  if default == 'no default value':
+    return dataclasses.field()
+  else:
+    return dataclasses.field(default_factory=default)
+
+
 class QuantMode(enum.Enum):
   TRAIN = 1
   CALIBRATE = 2
@@ -83,11 +97,12 @@ def dynamic_field(**kwargs):
   return flax.struct.field(pytree_node=True, **kwargs)
 
 
-def print_diff(str_a: str, str_b: str):
-  diff_generator = difflib.context_diff(str_a.split(' '), str_b.split(' '))
-  print('Diff:')
-  for diff in diff_generator:
-    print(diff)
+def print_diff(str_a: str, str_b: str, do_print_diff=False):
+  if do_print_diff:
+    diff_generator = difflib.context_diff(str_a.split(' '), str_b.split(' '))
+    print('Diff:')
+    for diff in diff_generator:
+      print(diff)
   print(f'first string (actual):\n{str_a}')
 
 
@@ -102,7 +117,7 @@ def test_pprint_eq(
   assert str_input_a == str_input_b, print_diff(str_input_a, str_input_b)
 
 
-def infer_dtype_from_bits(bits: int) -> jnp.dtype | None:
+def infer_dtype_from_bits(bits: int) -> None | jnp.dtype:
   """Get the dtype for the number of bits provided.
 
   Args:
@@ -135,6 +150,6 @@ def get_remaining_axes(
 
 @flax_slots_dataclass
 class Context:
-  key: jax.Array | None = dynamic_field()
-  train_step: int | None = dynamic_field()
+  key: None | jax.Array = dynamic_field()
+  train_step: None | int = dynamic_field()
   quant_mode: QuantMode = static_field(default=QuantMode.TRAIN)

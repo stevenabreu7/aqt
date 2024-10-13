@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2024 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Accurate Quantized Training library."""
+"""AQT APIs for pallas."""
 
-__version__ = "0.8.1"
+import aqt.jax.v2.pallas.dot_general as _aqt_dot_general
+import aqt.jax.v2.pallas.pallas_call as _aqt_pallas_call
+import aqt.jax.v2.pallas.quantizer as _aqt_quantizer
+
+pallas_call = _aqt_pallas_call.pallas_call
+quant = _aqt_quantizer.quant
+load_qtensor = _aqt_dot_general.load_qtensor
+dot_general = _aqt_dot_general.dot_general
+DequantMode = _aqt_dot_general.DequantMode

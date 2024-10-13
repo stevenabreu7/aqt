@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for dot_general."""
 import copy
 import functools
 from typing import Callable
@@ -23,18 +22,33 @@ from aqt.jax.v2 import aqt_quantizer
 from aqt.jax.v2 import calibration
 from aqt.jax.v2 import config
 from aqt.jax.v2 import stochastic_rounding
+from aqt.jax.v2 import tiled_dot_general
 from aqt.jax.v2 import utils
-import aqt.jax.v2.aqt_conv_general as aqt_conv
 import aqt.jax.v2.aqt_dot_general as aqt
 from aqt.jax.v2.numerics import int_numerics
 from aqt.jax.v2.numerics import no_numerics
 from aqt.jax.v2.numerics import numerics
-import flax.linen.linear as fl
-import flax.struct
 import jax
 import jax.numpy as jnp
 import numpy as np
 import scipy.stats
+
+
+def _apply_po2_scale(quantizer):
+  if quantizer.calibration is None:
+    return
+
+  calibration_cls = quantizer.calibration
+  # TODO(lew): Remove partial inspection wherever possible.
+  # Partial inspection is needed because the current implementation of delayed
+  # calibration initialization requires the configuration to be set via
+  # functools.partial.
+  keywords = {}
+  if isinstance(calibration_cls, functools.partial):
+    keywords = calibration_cls.keywords
+    calibration_cls = calibration_cls.func
+  keywords.update(po2_scale=True)
+  quantizer.calibration = functools.partial(calibration_cls, **keywords)
 
 
 def test_jaxpr_dtype(f, dg_raws: list[aqt.DotGeneralRaw], float_dtype):
@@ -61,7 +75,14 @@ def test_jaxpr_dtype(f, dg_raws: list[aqt.DotGeneralRaw], float_dtype):
     def assert_dtype_eq(dtype1, dtype2):
       assert dtype1 == dtype2, f"dtype1 != dtype2: {dtype1=} != {dtype2=}"
 
-    assert isinstance(dg_raw.dg_quantizer, aqt.DefaultDotGeneralQuantizer)
+    # Using str instead of isinstance to work with adhoc import.
+    assert (
+        str(type(dg_raw.dg_quantizer))
+        == "<class 'aqt.jax.v2.aqt_dot_general.DefaultDotGeneralQuantizer'>"
+    ), f"Invalid dg_quantizer type. {str(type(dg_raw.dg_quantizer))=}"
+    # assert isinstance(
+    #     dg_raw.dg_quantizer, aqt.DefaultDotGeneralQuantizer
+    # ), f"Invalid dg_quantizer type. {type(dg_raw.dg_quantizer)=}"
 
     lhs_dtype = dg_raw.dg_quantizer.lhs.numerics.get_dtype()
     rhs_dtype = dg_raw.dg_quantizer.rhs.numerics.get_dtype()
@@ -89,18 +110,31 @@ def rand_unif(shape, maxval, seed, dtype=jnp.float32):
 #
 # TODO(lew): Tests are a bit incomplete. What we need:
 # On top of that we shell test:
-#  - Gradinent is 1 in the range, 0 outside the abs-max range.
+#  - Gradient is 1 in the range, 0 outside the abs-max range.
 
 
 def test_eq(name, a, b):
+  assert a.shape == b.shape, (a.shape, b.shape)
   # TODO(lew): use library function.
   mean_err = jnp.mean(jnp.abs(a - b))
   if mean_err != 0.0:
     print("mean_err =", mean_err)
     print(a.shape)
-    print(a[:3, :3])
+    match a.ndim:
+      case 1:
+        print(a[:3])
+      case 2:
+        print(a[:3, :3])
+    print("sum =", jnp.sum(a))
+
     print(b.shape)
-    print(b[:3, :3])
+    match b.ndim:
+      case 1:
+        print(b[:3])
+      case 2:
+        print(b[:3, :3])
+    print("sum =", jnp.sum(b))
+
     print(f"FAIL: {name}")
     assert False
 
@@ -151,14 +185,15 @@ def fqt_param_dict(s, use_fwd_quant, **kwargs):
   )
 
 
-class _TrickyNumerics(numerics.AqtNumerics, flax.struct.PyTreeNode):
+@utils.flax_slots_kw_only_dataclass
+class _TrickyNumerics(numerics.AqtNumerics):
   # Needed because int8 casting would do additional clip and round.
-  dtype: jnp.dtype | None = None
+  dtype: None | jnp.dtype = None
 
   def get_dtype(self):
     return self.dtype
 
-  def abs_val_mapped_to(self) -> jnp.ndarray:
+  def get_quant_bound(self) -> jnp.ndarray:
     return jnp.array(1.0)
 
   def fwd(self, x, context):
@@ -182,9 +217,11 @@ def _modify_dg(
     rhs_dequant_mode: aqt.DequantMode = aqt.DequantMode.OUTPUT,
     lhs_calibration_mode: aqt.CalibrationMode = aqt.CalibrationMode.CONTRACTING_AXIS,
     rhs_calibration_mode: aqt.CalibrationMode = aqt.CalibrationMode.CONTRACTING_AXIS,
-    use_fwd_quant: bool | None = None,
+    use_fwd_quant: None | bool = None,
+    disable_rounding: bool = False,
     fwd_lhs_tricky_clip_and_round: bool = False,
-    local_aqt: aqt.LocalAqt | None = None,
+    local_aqt: None | aqt.LocalAqt = None,
+    use_mid_quant: bool = False,
     clip_gradient: bool = False,
 ) -> aqt.DotGeneral:
   dg = copy.deepcopy(readonly_dg)
@@ -192,14 +229,6 @@ def _modify_dg(
     # Tricky means that we have zero gradient on x < 0
     dg.fwd.dg_quantizer.lhs.numerics = _TrickyNumerics()
     dg.fwd.dg_accumulator_dtype = None
-
-  # Setting po2_scale is ensuring that fake_quant and full dot_general
-  # have the same numerics when scales are power of two (po2).
-  # We are passing dims to config so that we can reuse it in fake_quant.
-  # Power-of-2 scales allow FQ and AQT to be exactly the same.
-  def _apply_po2_scale(c):
-    c.dg_quantizer.lhs.po2_scale = True
-    c.dg_quantizer.rhs.po2_scale = True
 
   def _apply_dequant_mode(c, lhs_dequant_mode, rhs_dequant_mode):
     c.lhs.dequant_mode = lhs_dequant_mode
@@ -211,54 +240,55 @@ def _modify_dg(
 
   def _disable_quant_types(c, on_lhs=True, on_rhs=True):
     if on_lhs:
-      c.dg_quantizer.lhs.numerics = (
-          c.dg_quantizer.lhs.numerics.replace(dtype=None)
-      )
+      c.dg_quantizer.lhs.numerics.dtype = None
     if on_rhs:
-      c.dg_quantizer.rhs.numerics = (
-          c.dg_quantizer.rhs.numerics.replace(dtype=None)
-      )
+      c.dg_quantizer.rhs.numerics.dtype = None
     if on_lhs or on_rhs:
       c.dg_accumulator_dtype = None
 
   disable_lhs_quant = lhs_dequant_mode == aqt.DequantMode.THIS_INPUT
   disable_rhs_quant = rhs_dequant_mode == aqt.DequantMode.THIS_INPUT
   for c in [dg.fwd, dg.dlhs, dg.drhs]:
-    _apply_po2_scale(c)
+    # Setting po2_scale is ensuring that fake_quant and full dot_general
+    # have the same numerics when scales are power of two (po2).
+    # We are passing dims to config so that we can reuse it in fake_quant.
+    # Power-of-2 scales allow FQ and AQT to be exactly the same.
+    _apply_po2_scale(c.dg_quantizer.lhs)
+    _apply_po2_scale(c.dg_quantizer.rhs)
+
     _apply_dequant_mode(c, lhs_dequant_mode, rhs_dequant_mode)
-    _apply_calibration_mode(
-        c, lhs_calibration_mode, rhs_calibration_mode
-    )
+    _apply_calibration_mode(c, lhs_calibration_mode, rhs_calibration_mode)
     _disable_quant_types(c, disable_lhs_quant, disable_rhs_quant)
 
-  if use_fwd_quant is not None:
+  if disable_rounding:
     # If we disable all rounding, we are just testing whether the scales are
     # correct. We don't even need to disable clipping and we are testing
     # that the scales are not too large.
     def disable_quant(c):
       _disable_quant_types(c)
-      if isinstance(c.dg_quantizer.lhs.numerics, int_numerics.IntNumerics):
-        c.dg_quantizer.lhs.numerics = (
-            c.dg_quantizer.lhs.numerics.replace(round=False)
-        )
-      if isinstance(c.dg_quantizer.rhs.numerics, int_numerics.IntNumerics):
-        c.dg_quantizer.rhs.numerics = (
-            c.dg_quantizer.rhs.numerics.replace(round=False)
-        )
+      if isinstance(c.dg_quantizer.lhs.numerics, int_numerics.IntSymmetric):
+        c.dg_quantizer.lhs.numerics.round = False
+      if isinstance(c.dg_quantizer.rhs.numerics, int_numerics.IntSymmetric):
+        c.dg_quantizer.rhs.numerics.round = False
 
     disable_quant(dg.fwd)
     disable_quant(dg.dlhs)
     disable_quant(dg.drhs)
-    lhs_quant = not isinstance(
-        dg.fwd.dg_quantizer.lhs.numerics, no_numerics.NoNumerics
-    )
-    rhs_quant = not isinstance(
-        dg.fwd.dg_quantizer.rhs.numerics, no_numerics.NoNumerics
-    )
-    if lhs_quant:
+
+  if use_fwd_quant is not None:
+    if not isinstance(dg.fwd.dg_quantizer.lhs.numerics, no_numerics.NoNumerics):
       dg.drhs.rhs.use_fwd_quant = use_fwd_quant
-    if rhs_quant:
+    if not isinstance(dg.fwd.dg_quantizer.rhs.numerics, no_numerics.NoNumerics):
       dg.dlhs.rhs.use_fwd_quant = use_fwd_quant
+
+  if use_mid_quant:
+    config.set_use_mid_quant(
+        dg,
+        fwd_mid_alpha_both=1.0,
+        dlhs_mid_alpha_both=1.0,
+        drhs_mid_alpha_both=1.0,
+    )
+
   if local_aqt is not None:
     # Currently we are not supporting local_aqt in fwd pass
     # dg.fwd.local_aqt = local_aqt
@@ -266,14 +296,10 @@ def _modify_dg(
     dg.drhs.local_aqt = local_aqt
 
     # When using abs-max scaling, this should be a no-op.
-  if isinstance(dg.fwd.dg_quantizer.lhs.numerics, int_numerics.IntNumerics):
-    dg.fwd.dg_quantizer.lhs.numerics = (
-        dg.fwd.dg_quantizer.lhs.numerics.replace(clip_gradient=clip_gradient)
-    )
-  if isinstance(dg.fwd.dg_quantizer.rhs.numerics, int_numerics.IntNumerics):
-    dg.fwd.dg_quantizer.rhs.numerics = (
-        dg.fwd.dg_quantizer.rhs.numerics.replace(clip_gradient=clip_gradient)
-    )
+  if isinstance(dg.fwd.dg_quantizer.lhs.numerics, int_numerics.IntSymmetric):
+    dg.fwd.dg_quantizer.lhs.numerics.clip_gradient = clip_gradient
+  if isinstance(dg.fwd.dg_quantizer.rhs.numerics, int_numerics.IntSymmetric):
+    dg.fwd.dg_quantizer.rhs.numerics.clip_gradient = clip_gradient
 
   return dg
 
@@ -283,9 +309,11 @@ def _aqt_dg_full_lr_diff(
     rhs_dequant_mode: aqt.DequantMode,
     lhs_calibration_mode: aqt.CalibrationMode = aqt.CalibrationMode.CONTRACTING_AXIS,
     rhs_calibration_mode: aqt.CalibrationMode = aqt.CalibrationMode.CONTRACTING_AXIS,
-    use_fwd_quant: bool | None = None,
+    use_fwd_quant: None | bool = None,
+    use_mid_quant: bool = False,
+    disable_rounding: bool = False,
     fwd_lhs_tricky_clip_and_round: bool = False,
-    local_aqt: aqt.LocalAqt | None = None,
+    local_aqt: None | aqt.LocalAqt = None,
     *,
     readonly_dg: aqt.DotGeneral,
     dims: jax.lax.DotDimensionNumbers,
@@ -298,6 +326,8 @@ def _aqt_dg_full_lr_diff(
       lhs_calibration_mode=lhs_calibration_mode,
       rhs_calibration_mode=rhs_calibration_mode,
       use_fwd_quant=use_fwd_quant,
+      use_mid_quant=use_mid_quant,
+      disable_rounding=disable_rounding,
       fwd_lhs_tricky_clip_and_round=fwd_lhs_tricky_clip_and_round,
       local_aqt=local_aqt,
       clip_gradient=clip_gradient,
@@ -309,25 +339,29 @@ def _aqt_dg_full_lr_diff(
 def _aqt_dg_full(
     dequant_mode: aqt.DequantMode,
     calibration_mode: aqt.CalibrationMode = aqt.CalibrationMode.CONTRACTING_AXIS,
-    use_fwd_quant: bool | None = None,
+    use_fwd_quant: None | bool = None,
+    disable_rounding: bool = False,
     fwd_lhs_tricky_clip_and_round: bool = False,
-    local_aqt: aqt.LocalAqt | None = None,
+    local_aqt: None | aqt.LocalAqt = None,
+    use_mid_quant: bool = False,
     *,
     readonly_dg: aqt.DotGeneral,
     dims: jax.lax.DotDimensionNumbers,
     clip_gradient: bool = False,
 ) -> Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
   return _aqt_dg_full_lr_diff(
-      dequant_mode,
-      dequant_mode,
-      calibration_mode,
-      calibration_mode,
-      use_fwd_quant,
-      fwd_lhs_tricky_clip_and_round,
-      local_aqt,
+      lhs_dequant_mode=dequant_mode,
+      rhs_dequant_mode=dequant_mode,
+      lhs_calibration_mode=calibration_mode,
+      rhs_calibration_mode=calibration_mode,
+      use_fwd_quant=use_fwd_quant,
+      use_mid_quant=use_mid_quant,
+      disable_rounding=disable_rounding,
+      fwd_lhs_tricky_clip_and_round=fwd_lhs_tricky_clip_and_round,
+      local_aqt=local_aqt,
       readonly_dg=readonly_dg,
       dims=dims,
-      clip_gradient=clip_gradient
+      clip_gradient=clip_gradient,
   )
 
 
@@ -348,6 +382,7 @@ def _aqt_dg_raw_lr_diff(
       rhs_calibration_mode=rhs_calibration_mode,
   )
   dg = config.set_context(dg, key=jax.random.PRNGKey(4), train_step=None)
+  dg.fwd.dg_quantizer.init_calibration()
   return lambda lhs, rhs: dg.fwd(lhs, rhs, None, None, dims)[0]
 
 
@@ -383,7 +418,7 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
   def test_fq_noise(self, preserve_zero, prec, v, seed):
     key = jax.random.PRNGKey(seed)
     quantizer = config.quantizer_make(prec)
-    if isinstance(quantizer.numerics, int_numerics.IntNumerics):
+    if isinstance(quantizer.numerics, int_numerics.IntSymmetric):
       quantizer.numerics.preserve_zero = preserve_zero
       if not preserve_zero:
         quantizer.numerics.dtype = None
@@ -430,8 +465,9 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
       maxval=10.0,
       shape=(20, 1),
   ):
-    quantizer = config.quantizer_make(bits)
-    quantizer.po2_scale = True
+    quantizer = config.quantizer_make(bits, initialize_calibration=False)
+    _apply_po2_scale(quantizer)
+    quantizer.init_calibration()
     quantizer.calib_shared_axes = (0,)
     x = jnp.linspace(-maxval, maxval, num=shape[0]).reshape(shape)
     grad = jnp.ones(shape) * 12345.0
@@ -590,13 +626,42 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
 
     check([
         (
-            "fwd_quant=T",
-            aqt_dg_full(aqt.DequantMode.OUTPUT, use_fwd_quant=False),
+            "midQ FQ         ",
+            aqt_dg_full(
+                aqt.DequantMode.THIS_INPUT,
+                use_mid_quant=True,
+                use_fwd_quant=False,
+            ),
             dict(),
         ),
         (
+            "midQ       ",
+            aqt_dg_full(
+                aqt.DequantMode.OUTPUT,
+                use_mid_quant=True,
+                use_fwd_quant=False,
+            ),
+            dict(),
+        ),
+    ])
+
+    check([
+        (
             "fwd_quant=F",
-            aqt_dg_full(aqt.DequantMode.OUTPUT, use_fwd_quant=True),
+            aqt_dg_full(
+                aqt.DequantMode.OUTPUT,
+                use_fwd_quant=False,
+                disable_rounding=True,
+            ),
+            dict(),
+        ),
+        (
+            "fwd_quant=T",
+            aqt_dg_full(
+                aqt.DequantMode.OUTPUT,
+                use_fwd_quant=True,
+                disable_rounding=True,
+            ),
             dict(),
         ),
     ])
@@ -622,7 +687,7 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
 
     if isinstance(
         readonly_dg.fwd.dg_quantizer.lhs.numerics,
-        int_numerics.IntNumerics,
+        int_numerics.IntSymmetric,
     ):
       check([
           (
@@ -922,14 +987,10 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
 
     # Prepare utility functions for test.
     aqt_dg_full = functools.partial(
-        _aqt_dg_full,
-        readonly_dg=readonly_dg,
-        dims=dims
+        _aqt_dg_full, readonly_dg=readonly_dg, dims=dims
     )
     aqt_dg_full_lr_diff = functools.partial(
-        _aqt_dg_full_lr_diff,
-        readonly_dg=readonly_dg,
-        dims=dims
+        _aqt_dg_full_lr_diff, readonly_dg=readonly_dg, dims=dims
     )
     check = functools.partial(_check_result_eq, lhs=lhs, rhs=rhs, gra=gra)
 
@@ -937,12 +998,20 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
     check([
         (
             "CA         ",
-            aqt_dg_full(aqt.DequantMode.OUTPUT, use_fwd_quant=False),
+            aqt_dg_full(
+                aqt.DequantMode.OUTPUT,
+                use_fwd_quant=False,
+                disable_rounding=True,
+            ),
             dict(),
         ),
         (
             "CA fake    ",
-            aqt_dg_full(aqt.DequantMode.THIS_INPUT, use_fwd_quant=False),
+            aqt_dg_full(
+                aqt.DequantMode.THIS_INPUT,
+                use_fwd_quant=False,
+                disable_rounding=True,
+            ),
             dict(),
         ),
         (
@@ -1005,51 +1074,6 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
     assert dg_raw.dg_quantizer.rhs.numerics.get_dtype() == jnp.int8
 
   @parameterized.parameters([
-      (1, 1),
-      (1, 2),
-      (2, 1),
-      (2, 2),
-      (8, 8),
-      (None, 8),
-      (8, None),
-      (None, None),
-  ])
-  def test_conv_general_dilated(
-      self,
-      lhs_bits,
-      rhs_bits,
-      lhs_maxval=10.0,
-      rhs_maxval=20.0,
-      seed=0,
-  ):
-    dg_raw_conv = config.conv_general_dilated_make(2, lhs_bits, rhs_bits)
-
-    if dg_raw_conv.lhs:
-      # Power-of-2 scales allow FQ and AQT to be exactly the same.
-      dg_raw_conv.dg_quantizer.lhs.po2_scale = True
-    if dg_raw_conv.rhs:
-      dg_raw_conv.dg_quantizer.rhs.po2_scale = True
-
-    batch_n = 10
-    contr_n = 20
-    feature_n = 30
-    lhs = rand_unif((batch_n, 4, 5, contr_n), lhs_maxval, seed)
-    rhs = rand_unif((3, 3, contr_n, feature_n), rhs_maxval, seed + 1)
-
-    lax_conv = jax.lax.conv_general_dilated
-    aqt_conv_fn = aqt_conv.make_conv_general_dilated(dg_raw_conv)
-    kwargs = {
-        "window_strides": (1, 1),
-        "padding": "SAME",
-        "dimension_numbers": fl._conv_dimension_numbers(lhs.shape),
-    }
-    lhs_fq = aqt_quantizer.make_fake_quant(dg_raw_conv.dg_quantizer.lhs)(lhs)
-    rhs_fq = aqt_quantizer.make_fake_quant(dg_raw_conv.dg_quantizer.rhs)(rhs)
-    prod_fq = lax_conv(lhs_fq, rhs_fq, **kwargs)
-    prod_aqt = aqt_conv_fn(lhs, rhs, **kwargs)
-    assert (prod_aqt == prod_fq).all()
-
-  @parameterized.parameters([
       dict(
           shard_count=2,
           lhs=[1270.0, 10.0, 1270000.0, 10000.0],
@@ -1070,18 +1094,10 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
         use_stochastic_rounding=False,
         drhs_local_aqt=aqt.LocalAqt(contraction_axis_shard_count=shard_count),
     )
-    dg.fwd.dg_quantizer.lhs.numerics = (
-        dg.fwd.dg_quantizer.lhs.numerics.replace(preserve_max_val=True)
-    )
-    dg.fwd.dg_quantizer.rhs.numerics = (
-        dg.fwd.dg_quantizer.rhs.numerics.replace(preserve_max_val=True)
-    )
-    dg.drhs.dg_quantizer.lhs.numerics = (
-        dg.drhs.dg_quantizer.lhs.numerics.replace(preserve_max_val=True)
-    )
-    dg.drhs.dg_quantizer.rhs.numerics = (
-        dg.drhs.dg_quantizer.rhs.numerics.replace(preserve_max_val=True)
-    )
+    dg.fwd.dg_quantizer.lhs.numerics.preserve_max_val = True
+    dg.fwd.dg_quantizer.rhs.numerics.preserve_max_val = True
+    dg.drhs.dg_quantizer.lhs.numerics.preserve_max_val = True
+    dg.drhs.dg_quantizer.rhs.numerics.preserve_max_val = True
     dg_f = lambda lhs, rhs: dg(
         lhs,
         rhs,
@@ -1096,7 +1112,7 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
   def test_per_tensor(self):
     # TODO(lew): bits=8 started failing in VLP colab due x/x != 1.0 sometimes
     bits = 4
-    my_numerics = int_numerics.IntNumerics(
+    my_numerics = int_numerics.IntSymmetric(
         bits=bits,
         preserve_zero=True,
         preserve_max_val=False,
@@ -1111,9 +1127,10 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
         calib_shared_axes="per_tensor",
         scale_stop_grad=True,
         calibration=calibration.AbsMaxCalibration,
-        po2_scale=False,
         context=utils.Context(key=None, train_step=None),
     )
+    # TODO(lew): Perhaps post_init call could work?
+    quantizer.init_calibration()
 
     x = jnp.array([
         [1, 2, 3, 4],
@@ -1122,6 +1139,71 @@ class AqtDotGeneralResearchTest(parameterized.TestCase):
     ])
     qx, _ = quantizer.quant(x, calibration_axes=None)
     self.assertEqual(qx.scale, [jnp.array([[1.0]])])
+
+  def test_per_subchannel(self):
+    # TODO(lew): bits=8 started failing in VLP colab due x/x != 1.0 sometimes
+    bits = 4
+
+    # NOTE: The scale dtype must be set to a float dtype when quantizing an
+    # integer input, as jax does not support taking the inverse of an integer.
+    quantizer = aqt_quantizer.quantizer_make(bits, scale_dtype=jnp.float32)
+    x = jnp.arange(0, 64).reshape((4, 4, 4))
+
+    tiling_state = tiled_dot_general.generate_tiling_state(
+        x,
+        [tiled_dot_general.AxisTiling(axis=2, tile_size=2)],
+    )
+    qx, _ = quantizer.quant(
+        x, calibration_axes=[0, 2], tiling_state=tiling_state
+    )
+    self.assertEqual(qx.qvalue.shape, (4, 4, 2, 2))
+    self.assertEqual(qx.scale[0].shape, (1, 4, 2, 1))
+    self.assertEqual(qx.scale[0].dtype, jnp.float32)
+
+    x = qx.dequant()
+    self.assertEqual(x.shape, (4, 4, 4))
+
+  def test_mid_quantization(self):
+    def make_binary_dg(use_mid):
+      mid_alpha: str | float = 0.5 if use_mid else config.SKIP
+      bits = 1
+      dg = config.config_v4(
+          fwd_bits=bits,
+          dlhs_bits=bits,
+          drhs_bits=bits,
+          fwd_mid_alpha_both=mid_alpha,
+          dlhs_mid_alpha_both=mid_alpha,
+          drhs_mid_alpha_both=mid_alpha,
+      )
+      # for exact equality
+      dg.fwd.dg_quantizer.lhs.numerics.preserve_max_val = True
+      dg.fwd.dg_quantizer.rhs.numerics.preserve_max_val = True
+      # PO2 scales for exact equality
+      dg.fwd.dg_quantizer.lhs.calibration = functools.partial(
+          dg.fwd.dg_quantizer.lhs.calibration, po2_scale=True
+      )
+      dg.fwd.dg_quantizer.rhs.calibration = functools.partial(
+          dg.fwd.dg_quantizer.rhs.calibration, po2_scale=True
+      )
+      return dg
+
+    # Note that we are testing with mid_alpha = 0.5, and po2 scales.
+    a = jnp.array([[1.0, 2.0, 4.0], [1.0, 4.0, 16.0]])
+    b = jnp.array([[4.0, 2.0, 1.0], [16.0, 4.0, 1.0]])
+    ret = jnp.array([4.0, 16.0]) * 3.0
+    dimension_numbers = (((1,), (1,)), ((0,), (0,)))
+
+    # Sanity check.
+    test_eq("", jax.lax.dot_general(a, b, dimension_numbers), ret)
+
+    # Without mid quantization all values in a, b will be rounded up
+    # to 4.0 or 8.0 because of binary quantization.
+    ret_no_mid = jnp.array([3 * 4.0**2, 3 * 16.0**2])
+    test_eq("", make_binary_dg(False)(a, b, dimension_numbers), ret_no_mid)
+
+    # With mid scales all values in a, b will be equal to 2.0 and
+    # binary quantization will be lossless.
+    test_eq("", make_binary_dg(True)(a, b, dimension_numbers), ret)
 
 
 if __name__ == "__main__":

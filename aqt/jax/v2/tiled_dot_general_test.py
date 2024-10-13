@@ -54,18 +54,22 @@ def assign_input_shape(
 
 
 def get_axis_tiles(
-    axes: list[AxisIdx], shape: list[int]
+    axes: list[AxisIdx], input_shape: list[int], subsample_ts: int = 2
 ) -> list[list[AxisTiling]]:
-  # Assume tiling all axes
-  ret = list(
-      itertools.product(*[
-          [
-              tiled_dot_general.AxisTiling(axis, tc, shape[axis] // tc)
-              for tc in sympy.divisors(shape[axis])
-          ]
-          for axis in axes
-      ])
-  )
+  comb = [list(itertools.combinations(axes, i)) for i in range(len(axes) + 1)]
+  axes_tile_choices = list(itertools.chain(*comb))  # flatten lists
+  ret = []
+  for axes_to_tile in axes_tile_choices:
+    selected_axis_cfg = []
+    for axis in axes_to_tile:
+      # Only consider testing part of the tile sizes as they have little impact.
+      all_ts = sympy.divisors(input_shape[axis])[::subsample_ts]
+      selected_axis_cfg.append(
+          [tiled_dot_general.AxisTiling(axis, None, ts) for ts in all_ts]
+      )
+    tile_cfg = list(itertools.product(*selected_axis_cfg))
+    ret.extend(list(tile_cfg))
+
   return ret
 
 
@@ -118,10 +122,9 @@ def generate_tiling_cfgs(lhs_shape, lhs_ca, lhs_ra, rhs_shape, rhs_ca, rhs_ra):
 
   cfgs = []
   assert len(lhs_contraction_axes_tilings) == len(rhs_contraction_axes_tilings)
-  # Skip some tests since test size is too big
-  for i in range(0, len(lhs_contraction_axes_tilings), 3):
-    for j in range(0, len(lhs_remaining_axis_tilings), 3):
-      for k in range(0, len(rhs_remaining_axis_tilings), 3):
+  for i in range(len(lhs_contraction_axes_tilings)):
+    for j in range(len(lhs_remaining_axis_tilings)):
+      for k in range(len(rhs_remaining_axis_tilings)):
         cfgs.append(
             tiled_dot_general.Cfg(
                 lhs=tiled_dot_general.TensorTiling(
@@ -143,7 +146,7 @@ class TiledDotGeneralTest(parameterized.TestCase):
   def test_tiled_dot_general_shape(self):
     for i in range(10):
       key1, key2 = jax.random.split(jax.random.PRNGKey(i), 2)
-      hypers = jax.random.randint(key1, shape=(4,), minval=2, maxval=7)
+      hypers = jax.random.randint(key1, shape=(4,), minval=2, maxval=5)
       num_ca = hypers[0]
       num_ba = hypers[1]
       num_lhs_ra = hypers[2]
@@ -188,9 +191,9 @@ class TiledDotGeneralTest(parameterized.TestCase):
   def test_tiled_dot_general(self):
     num_ca = 2
     num_ba = 2
-    num_lhs_ra = 2
+    num_lhs_ra = 1
     num_rhs_ra = 2
-    max_shape_val = 32
+    max_shape_val = 12
     key = jax.random.PRNGKey(7)
     lhs, rhs, lhs_axes, rhs_axes = generate_inputs(
         key, num_ca, num_ba, num_lhs_ra, num_rhs_ra, max_shape_val
@@ -221,32 +224,79 @@ class TiledDotGeneralTest(parameterized.TestCase):
       assert (output == expected_output).all(), msg
 
   def test_single(self):
-    lhs_shape = (31, 22, 9, 22, 27)
-    rhs_shape = (22, 9, 22, 27, 7, 12)
+    lhs_shape = (31, 22, 9, 8, 27)
+    rhs_shape = (8, 9, 22, 27, 7, 12)
     lhs = jnp.ones(lhs_shape)
     rhs = jnp.ones(rhs_shape)
     cfg = Cfg(
         lhs=TensorTiling(
             contraction_axes=[
-                AxisTiling(axis=2, tile_count=1, tile_size=9),
-                AxisTiling(axis=1, tile_count=1, tile_size=22),
+                AxisTiling(axis=2, tile_count=None, tile_size=9),
+                AxisTiling(axis=1, tile_count=None, tile_size=11),
             ],
-            remaining_axes=[AxisTiling(axis=0, tile_count=1, tile_size=31)],
+            remaining_axes=[
+                # AxisTiling(axis=0, tile_count=1, tile_size=31)
+            ],
         ),
         rhs=TensorTiling(
             contraction_axes=[
-                AxisTiling(axis=1, tile_count=1, tile_size=9),
-                AxisTiling(axis=2, tile_count=1, tile_size=22),
+                AxisTiling(axis=1, tile_count=None, tile_size=9),
+                AxisTiling(axis=2, tile_count=None, tile_size=11),
             ],
             remaining_axes=[
-                AxisTiling(axis=5, tile_count=1, tile_size=12),
-                AxisTiling(axis=4, tile_count=7, tile_size=1),
+                AxisTiling(axis=5, tile_count=None, tile_size=4),
+                # AxisTiling(axis=4, tile_count=7, tile_size=1),
             ],
         ),
     )
     dims = (((2, 1), (1, 2)), ((4, 3), (3, 0)))
     out = tiled_dot_general.tiled_dot_general(cfg, lhs, rhs, dims)
     assert out.shape == jax.lax.dot_general(lhs, rhs, dims).shape
+
+  def test_tiling_state_for_single_tensor(self):
+    t_shape = (31, 22, 27, 8, 27)
+    t = jnp.ones(t_shape)
+    tiled_axes = [
+        AxisTiling(axis=1, tile_count=None, tile_size=11),
+        AxisTiling(axis=2, tile_count=None, tile_size=9),
+    ]
+    t_tiling_state = tiled_dot_general.generate_tiling_state(
+        t, tiled_axes,
+    )
+    self.assertEqual(t_tiling_state.untiled_shape, t_shape)
+    self.assertEqual(t_tiling_state.tiled_shape, [31, 2, 11, 3, 9, 8, 27])
+    self.assertDictEqual(
+        t_tiling_state.tile_map, {0: [0], 1: [1, 2], 2: [3, 4], 3: [5], 4: [6]}
+    )
+    tiled_axes, ca_axes = t_tiling_state.to_tiled_axes_transposed(
+        [ax.axis for ax in tiled_axes]
+    )
+    self.assertEqual(tiled_axes, [1, 3])
+    self.assertEqual(ca_axes, [2, 4])
+
+  def test_negative_axis_index(self):
+    t_shape = (31, 22, 27, 8, 27)
+    t = jnp.ones(t_shape)
+
+    # AxisTiling suppoorts negative axis index
+    tiled_axes = [
+        AxisTiling(axis=-1, tile_count=None, tile_size=9),
+        AxisTiling(axis=-2, tile_count=2, tile_size=None),
+    ]
+    t_tiling_state = tiled_dot_general.generate_tiling_state(
+        t, tiled_axes
+    )
+
+    self.assertEqual(t_tiling_state.untiled_shape, t_shape)
+    self.assertEqual(t_tiling_state.tiled_shape, [31, 22, 27, 2, 4, 3, 9])
+    self.assertEqual(
+        t_tiling_state.tile_map, {0: [0], 1: [1], 2: [2], 3: [3, 4], 4: [5, 6]}
+    )
+
+    # to_tiled_axes_transposed supports negative axis index
+    self.assertEqual(t_tiling_state.to_tiled_axes_transposed([-1]), ([5], [6]))
+    self.assertEqual(t_tiling_state.to_tiled_axes_transposed([-2]), ([3], [4]))
+    self.assertEqual(t_tiling_state.to_tiled_axes_transposed([-3]), ([], [2]))
 
 
 if __name__ == '__main__':

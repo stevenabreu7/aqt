@@ -13,7 +13,7 @@
 # limitations under the License.
 """Numerics for int8, int4, binary and other integer types."""
 
-from typing import Any, Optional
+from typing import Any
 from aqt.jax.v2 import stochastic_rounding
 from aqt.jax.v2 import utils
 from aqt.jax.v2.numerics import numerics
@@ -22,19 +22,21 @@ import jax.numpy as jnp
 
 
 @utils.flax_slots_kw_only_dataclass
-class IntNumerics(numerics.AqtNumerics):
-  """Numerics for int8, int4, binary, etc."""
+class IntSymmetric(numerics.AqtNumerics):
+  """Symmetric numerics for sint8, sint4, binary, etc."""
 
   bits: int
   preserve_zero: bool
   # false = map max val on the end of the last bucket
   # true = map max val on the middle of the last
   preserve_max_val: bool
+  # The quantized values are only guarenteed to be within the appropriate signed
+  # int range if clip=True and round=True.
   clip: bool
   clip_gradient: bool
   round: bool
-  noise_fn: Optional[stochastic_rounding.NoiseFn]
-  dtype: Optional[Any] = None
+  noise_fn: None | stochastic_rounding.NoiseFn
+  dtype: None | Any = None
 
   # pylint: disable=line-too-long
   # Verifying the correctness of these functions amounts to verifying this table:
@@ -56,7 +58,7 @@ class IntNumerics(numerics.AqtNumerics):
   def get_center_of_last_int_bucket(self):
     return self.get_edge_of_last_int_bucket() - 0.5
 
-  def abs_val_mapped_to(self):
+  def get_quant_bound(self):
     if self.preserve_max_val:
       return self.get_center_of_last_int_bucket()
     else:
